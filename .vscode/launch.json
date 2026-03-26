@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Train Model",  // 自定义名称
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/train.py",  // 替换为你的训练脚本路径
+            "args": ["mydata/test_model/segformer_mit-b3_512x512_160k_greenland.py"],  // 替换为你的训练配置文件路径
+            "python": "C:/ProgramData/miniconda3/envs/MMSegmentation0x/python", // 替换为你的Conda环境路径
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
