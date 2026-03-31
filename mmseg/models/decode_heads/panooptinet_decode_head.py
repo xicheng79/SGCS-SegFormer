@@ -90,87 +90,82 @@ class PanoOptiNetHead(SegformerHead):
     #     - 推理时 patch 顺序与 SAS 路径不一致。
     #   在上述场景下，请确保数据集按 patch ID 顺序排列，且 batch_size=1，才能得到正确结果。
     @staticmethod
-    def _parse_dx_dy_from_meta(img_metas):
-        """从 img_metas 中解析滑动方向 (dx, dy)。
-        
-        文件命名约定：<prefix>_<id>_<dx>_<dy>.<ext>
-        dx: 行方向偏移（-1/0/1），dy: 列方向偏移（-1/0/1）
+    def _parse_sides_from_meta(img_metas):
+        """从 img_metas 中解析 FTC/FTP 边缘标识符。
+
+        文件命名约定：<prefix>_<id>_<ftc_side>_<recv_side>.<ext>
+          ftc_side：本 patch 在 FTC 阶段应裁剪的边（-1 表示无移动）
+          recv_side：本 patch 在 FTP 阶段应接收注入的边（-1 表示无移动）
         """
         filename = img_metas[0]['filename']
         if filename is None:
-            return 0, 0
+            return -1, -1
         filename = os.path.splitext(os.path.basename(filename))[0]
         parts = filename.split('_')
-        dx = int(parts[-2])
-        dy = int(parts[-1])
-        return dx, dy
+        ftc_side = int(parts[-2])
+        recv_side = int(parts[-1])
+        return ftc_side, recv_side
 
     def forward_train(self, inputs, img_metas, gt_semantic_seg, train_cfg):
         """PanoOptiNet 训练阶段前向函数，支持返回 overlap 特征。"""
-        dx, dy = self._parse_dx_dy_from_meta(img_metas)
-        seg_logits, overlap = self(inputs, dx, dy)
+        ftc_side, recv_side = self._parse_sides_from_meta(img_metas)
+        seg_logits, overlap = self(inputs, ftc_side)
         losses = self.losses(seg_logits, gt_semantic_seg)
         return losses, overlap
 
     def forward_test(self, inputs, img_metas, test_cfg):
         """PanoOptiNet 测试阶段前向函数，支持返回 overlap 特征。"""
-        dx, dy = self._parse_dx_dy_from_meta(img_metas)
-        seg_logits, overlap = self.forward(inputs, dx, dy)
+        ftc_side, recv_side = self._parse_sides_from_meta(img_metas)
+        seg_logits, overlap = self.forward(inputs, ftc_side)
         return seg_logits, overlap
 
-    # our PanoOptiNet code: 根据dx, dy提供的方向信息找到滑动路径上的重叠的部分
-    def featureTemplateCopy(self, x, dx, dy, out_hw_shape):
+    # our PanoOptiNet code: 根据 ftc_side 提供的边缘标识直接裁剪重叠区域
+    def featureTemplateCopy(self, x, ftc_side, out_hw_shape):
         """
-        根据滑动方向提取重叠区域特征。
+        根据 ftc_side 直接提取当前 patch 的前沿特征（FTC）。
 
         参数:
             x: 输入特征图，形状为 (B, C, H, W)
-            dx: x轴滑动方向 (-1, 0, 1)
-            dy: y轴滑动方向 (-1, 0, 1)
+            ftc_side: FTC 裁剪边编码
+                0=底边  1=顶边  2=右边  3=左边
+                4=右下角  5=左下角  6=右上角  7=左上角
+                -1=无移动（不应调用本函数）
             out_hw_shape: 输出特征图的 (height, width)
 
         返回:
-            提取的重叠区域特征，形状为 (B, C, H/4, W/4)
+            提取的前沿特征区域，形状为 (B, C, H_s, W_s)
         """
         # 检查输入参数合法性
         if not isinstance(out_hw_shape, (tuple, list)) or len(out_hw_shape) != 2:
             raise ValueError("out_hw_shape 应为包含两个整数的元组或列表 (height, width)")
-        
-        if not (dx in [-1, 0, 1] and dy in [-1, 0, 1]) or (dx == 0 and dy == 0):
-            raise ValueError("dx 和 dy 必须为 -1、0 或 1，且不能同时为 0")
-        
+
         if x.ndim != 4:
             raise ValueError("输入特征图 x 应为 4 维张量 (B, C, H, W)")
 
         B, C, H, W = x.shape
         out_h, out_w = out_hw_shape
-        shift_h = out_h // 4
-        shift_w = out_w // 4
+        sh = out_h // 4  # 边带高度
+        sw = out_w // 4  # 边带宽度
+        rh = out_h       # 全高
+        rw = out_w       # 全宽
 
-        region_h = out_h
-        region_w = out_w
-
-        # 映射方向到切片范围
-        # 坐标约定：dx 对应行（height），dy 对应列（width）
-        #   dx = -1 → 行索引减小 → 向上移动 → 裁剪顶部边缘
-        #   dx = +1 → 行索引增大 → 向下移动 → 裁剪底部边缘
-        #   dy = -1 → 列索引减小 → 向左移动 → 裁剪左侧边缘
-        #   dy = +1 → 列索引增大 → 向右移动 → 裁剪右侧边缘
-        direction_slices = {
-            (-1, 0):  (slice(0, shift_h), slice(0, region_w)),                           # 向上：裁剪顶部行带
-            (-1, 1):  (slice(0, shift_h), slice(region_w - shift_w, region_w)),          # 向上+向右：裁剪右上角
-            (0, 1):   (slice(0, region_h), slice(region_w - shift_w, region_w)),         # 向右：裁剪右侧列带
-            (1, 1):   (slice(region_h - shift_h, region_h), slice(region_w - shift_w, region_w)),  # 向下+向右：裁剪右下角
-            (1, 0):   (slice(region_h - shift_h, region_h), slice(0, region_w)),         # 向下：裁剪底部行带
-            (1, -1):  (slice(region_h - shift_h, region_h), slice(0, shift_w)),          # 向下+向左：裁剪左下角
-            (0, -1):  (slice(0, region_h), slice(0, shift_w)),                            # 向左：裁剪左侧列带
-            (-1, -1): (slice(0, shift_h), slice(0, shift_w)),                             # 向上+向左：裁剪左上角
+        # ftc_side → (行切片, 列切片)
+        # 语义：裁剪当前 patch 中朝向下一个 patch 的那条边（前沿）
+        side_slices = {
+            0: (slice(rh - sh, rh), slice(0, rw)),        # 底边（向下前进的前沿）
+            1: (slice(0, sh),       slice(0, rw)),         # 顶边（向上前进的前沿）
+            2: (slice(0, rh),       slice(rw - sw, rw)),   # 右边（向右前进的前沿）
+            3: (slice(0, rh),       slice(0, sw)),         # 左边（向左前进的前沿）
+            4: (slice(rh - sh, rh), slice(rw - sw, rw)),  # 右下角（向右下前进的前沿）
+            5: (slice(rh - sh, rh), slice(0, sw)),        # 左下角（向左下前进的前沿）
+            6: (slice(0, sh),       slice(rw - sw, rw)),  # 右上角（向右上前进的前沿）
+            7: (slice(0, sh),       slice(0, sw)),        # 左上角（向左上前进的前沿）
         }
 
-        slice_h, slice_w = direction_slices.get((dx, dy), (None, None))
-        if slice_h is None or slice_w is None:
-            raise ValueError(f"不支持的滑动方向 dx={dx}, dy={dy}")
+        if ftc_side not in side_slices:
+            raise ValueError(f"不支持的 ftc_side={ftc_side}，合法值为 0~7")
 
+        slice_h, slice_w = side_slices[ftc_side]
         # 安全裁剪
         try:
             overlap_data = x[:, :, slice_h, slice_w]
@@ -180,28 +175,26 @@ class PanoOptiNetHead(SegformerHead):
         return overlap_data
 
     
-    def forward(self, inputs, dx=0, dy=0):
+    def forward(self, inputs, ftc_side=-1):
         """前向传播函数
-        
+
         功能：
         1. 处理多尺度输入特征（利用父类SegformerHead的功能）
         2. 生成主分割结果
-        3. 提取滑动窗口重叠区域特征
-        
+        3. 若 ftc_side != -1，提取前沿特征作为 overlap 供下一帧 FTP 注入
+
         参数：
             inputs: 多尺度输入特征列表
-            dx: x轴滑动方向，默认为0
-            dy: y轴滑动方向，默认为0
-            
+            ftc_side: FTC 裁剪边编码（-1 表示无移动，不触发 FTC）
+
         返回：
-            tuple: (主分割结果, 重叠区域特征)
+            tuple: (主分割结果, overlap 或 None)
         """
         # 处理输入特征
         inputs = self._transform_inputs(inputs)
-        
+
         # 处理重叠区域特征提取
         outs_overlap = []
-
         overlap = None
 
         for idx in range(len(inputs)):
@@ -213,7 +206,7 @@ class PanoOptiNetHead(SegformerHead):
                     size=inputs[0].shape[2:],
                     mode=self.interpolate_mode,
                     align_corners=self.align_corners))
-        
+
         # 使用父类SegformerHead的处理逻辑生成分割结果
         # 但不调用父类的forward方法，因为我们需要自定义返回值
         outs = []
@@ -229,14 +222,14 @@ class PanoOptiNetHead(SegformerHead):
 
         out = self.fusion_conv(torch.cat(outs, dim=1))
         out_overlap = self.fusion_conv_overlap(torch.cat(outs_overlap, dim=1))
-        
-        # 当有滑动时(dx或dy不为0)，提取重叠区域
-        if (dx!=0 or dy!=0) :
+
+        # 当 ftc_side != -1 时，提取前沿特征（FTC）
+        if ftc_side != -1:
             hw_shape = (out_overlap.shape[2], out_overlap.shape[3])
-            overlap = self.featureTemplateCopy(out_overlap, dx, dy, hw_shape) # hw_shape=(128,128)
+            overlap = self.featureTemplateCopy(out_overlap, ftc_side, hw_shape)
             overlap = overlap.detach()
-            
+
         # 生成最终分割结果
-        out = self.cls_seg(out)   #torch.Size([1, 2, 128, 128])
-        
+        out = self.cls_seg(out)   # torch.Size([1, 2, 128, 128])
+
         return out, overlap

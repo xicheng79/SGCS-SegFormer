@@ -92,81 +92,51 @@ class PanoOptiNetMixVisionTransformer(MixVisionTransformer):
         )
         
         # 添加PanoOptiNet特有的属性
-        self.last_dx = None
-        self.last_dy = None
+        # last_dx/last_dy 已废弃：方向信息由文件名中的 recv_side 直接携带，无需运行时状态
 
-    # our PanoOptiNet code: 根据dx, dy提供的方向信息将重叠的部分复制到对应的位置
-    def featureTemplatePaste(self, x, overlap_data, dx, dy, out_hw_shape):
+    # our PanoOptiNet code: 根据 recv_side 提供的边缘标识将重叠特征粘贴到对应位置
+    def featureTemplatePaste(self, x, overlap_data, recv_side, out_hw_shape):
         """
-        根据方向信息 `(dx, dy)`，将重叠部分的数据复制到特征图的对应位置。
+        根据 recv_side 直接将前一帧的前沿特征（overlap）注入当前 patch 的后沿（FTP）。
+
         参数:
             x (Tensor): 输入特征图，形状为 (batch, channels, H, W)。
-            overlap_data (Tensor): 重叠部分的数据，形状与目标区域一致。
-            dx (int): x 方向上的偏移量。
-            dy (int): y 方向上的偏移量。
+            overlap_data (Tensor): 前一帧 FTC 裁剪的前沿特征，形状与目标区域一致。
+            recv_side (int): FTP 接收边编码（由文件名直接携带，SAS 阶段已算好）
+                0=底边  1=顶边  2=右边  3=左边
+                4=右下角  5=左下角  6=右上角  7=左上角
             out_hw_shape (tuple): 输出特征图的空间形状 (H, W)。
         返回:
-            Tensor: 处理后的特征图，形状为 (batch, channels, H, W)。
-        异常:
-            ValueError: 如果 `(dx, dy)` 不合法，或者 `overlap_data` 的形状与目标区域不匹配。
+            Tensor: 注入后的特征图，形状为 (batch, channels, H, W)。
         """
-        # 计算偏移量和区域大小
-        shift_size = int(out_hw_shape[0] / 4)  # out_hw_shape=(128,128)
-        region_size = int(out_hw_shape[0])  # out_hw_shape=(128,128)
-        # 定义方向到目标区域的映射（对向切片）
-        # FTC 从前一个 patch 裁剪"朝向当前 patch 的那一侧"（同向边缘）。
-        # FTP 应将该特征粘贴到当前 patch"朝向前一个 patch 的那一侧"（对向边缘）。
-        # 因此，移动方向 (dx, dy) 对应的粘贴位置为 (-dx, -dy) 方向的边缘。
-        #
-        # 坐标约定：dx 对应行（height），dy 对应列（width）
-        #   dx = -1 → 行方向向前（上方），粘贴到顶部   → dx=+1 时粘贴到底部
-        #   dx = +1 → 行方向向后（下方），粘贴到底部   → dx=-1 时粘贴到顶部
-        #   dy = -1 → 列方向向前（左方），粘贴到左侧   → dy=+1 时粘贴到右侧
-        #   dy = +1 → 列方向向后（右方），粘贴到右侧   → dy=-1 时粘贴到左侧
-        dx_dy_to_slice = {
-            # 移动方向 (-1, 0)：前patch在上→当前patch底部对接→粘贴到底部
-            (-1, 0): (slice(region_size - shift_size, region_size), slice(0, region_size)),
-            # 移动方向 (-1, 1)：前patch在左上→当前patch右下角对接→粘贴到右下角
-            (-1, 1): (
-                slice(region_size - shift_size, region_size),
-                slice(0, shift_size),
-            ),
-            # 移动方向 (0, 1)：前patch在左→当前patch右列对接→粘贴到左侧
-            (0, 1): (
-                slice(0, region_size),
-                slice(0, shift_size),
-            ),
-            # 移动方向 (1, 1)：前patch在左下→当前patch右上角对接→粘贴到左上角
-            (1, 1): (
-                slice(0, shift_size),
-                slice(0, shift_size),
-            ),
-            # 移动方向 (1, 0)：前patch在下→当前patch顶部对接→粘贴到顶部
-            (1, 0): (
-                slice(0, shift_size),
-                slice(0, region_size),
-            ),
-            # 移动方向 (1, -1)：前patch在右下→当前patch左上角对接→粘贴到右上角
-            (1, -1): (
-                slice(0, shift_size),
-                slice(region_size - shift_size, region_size),
-            ),
-            # 移动方向 (0, -1)：前patch在右→当前patch左列对接→粘贴到右侧
-            (0, -1): (slice(0, region_size), slice(region_size - shift_size, region_size)),
-            # 移动方向 (-1, -1)：前patch在右上→当前patch左下角对接→粘贴到右下角
-            (-1, -1): (slice(region_size - shift_size, region_size), slice(region_size - shift_size, region_size)),
+        sh = int(out_hw_shape[0] / 4)  # 边带高度
+        sw = int(out_hw_shape[1] / 4)  # 边带宽度
+        rh = int(out_hw_shape[0])      # 全高
+        rw = int(out_hw_shape[1])      # 全宽
+
+        # recv_side → (行切片, 列切片)
+        # 语义：将 overlap 粘贴到当前 patch 中朝向前一个 patch 的那条边（后沿）
+        # recv_side 恒等于前一帧 ftc_side 的对边，由 SAS 直接写入文件名，无需运行时推算。
+        side_slices = {
+            0: (slice(rh - sh, rh), slice(0, rw)),       # 底边（前一帧向下，当前帧从底部接收）
+            1: (slice(0, sh),       slice(0, rw)),        # 顶边（前一帧向上，当前帧从顶部接收）
+            2: (slice(0, rh),       slice(rw - sw, rw)),  # 右边（前一帧向右，当前帧从右侧接收）
+            3: (slice(0, rh),       slice(0, sw)),        # 左边（前一帧向左，当前帧从左侧接收）
+            4: (slice(rh - sh, rh), slice(rw - sw, rw)), # 右下角
+            5: (slice(rh - sh, rh), slice(0, sw)),       # 左下角
+            6: (slice(0, sh),       slice(rw - sw, rw)), # 右上角
+            7: (slice(0, sh),       slice(0, sw)),       # 左上角
         }
-        if (dx, dy) not in dx_dy_to_slice:
-            raise ValueError(f"Unsupported dx={dx} and dy={dy} combination.")
-        target_slice = dx_dy_to_slice[(dx, dy)]
-        # 检查重叠数据的形状是否与目标区域一致
-        if overlap_data.shape != x[:, :, target_slice[0], target_slice[1]].shape:
-            raise ValueError("Overlap data shape does not match target region.")
-        # 将重叠数据复制到目标区域
-        if (dx, dy) in dx_dy_to_slice:
-            x[:, :, dx_dy_to_slice[(dx, dy)][0], dx_dy_to_slice[(dx, dy)][1]] = (
-                overlap_data
-            )
+
+        if recv_side not in side_slices:
+            raise ValueError(f"不支持的 recv_side={recv_side}，合法值为 0~7")
+
+        slice_h, slice_w = side_slices[recv_side]
+        target = x[:, :, slice_h, slice_w]
+        if overlap_data.shape != target.shape:
+            raise ValueError(
+                f"overlap_data.shape={overlap_data.shape} 与目标区域 shape={target.shape} 不匹配")
+        x[:, :, slice_h, slice_w] = overlap_data
         return x
 
     def forward(self, x, img_metas, overlap):
@@ -175,22 +145,22 @@ class PanoOptiNetMixVisionTransformer(MixVisionTransformer):
         参数:
             x (Tensor): 输入特征，形状为 (batch, channels, H, W)。
             img_metas (list): 图像的元信息，包含文件名等信息。
-            overlap (Tensor): 重叠部分的数据，用于 PanoOptiNet 的自定义处理。
+            overlap (Tensor): 前一帧 FTC 裁剪的前沿特征，用于 FTP 注入当前帧后沿。
         返回:
             list: 输出特征列表，每个元素的形状为 (batch, channels, H, W)。
         """
         # 如果文件名未指定，则使用父类的标准处理流程
         if img_metas[0]["filename"] is None:
-            # 调用父类的forward方法，但父类的forward只接受x参数
             return super(PanoOptiNetMixVisionTransformer, self).forward(x)
         # 如果文件名已指定，则走 PanoOptiNet 的自定义处理流程
         else:
             filename = img_metas[0]["filename"]
-            filename = os.path.basename(filename)
-            filename = os.path.splitext(filename)[0]
-            dx = int(filename.split("_")[-2])
-            dy = int(filename.split("_")[-1])
-            id = int(filename.split("_")[-3])
+            filename = os.path.splitext(os.path.basename(filename))[0]
+            parts = filename.split("_")
+            # 文件名格式：<name>_<id>_<ftc_side>_<recv_side>
+            patch_id   = int(parts[-3])
+            # ftc_side 属于本帧（由解码头使用），此处只需 recv_side
+            recv_side  = int(parts[-1])
 
             outs = []
             for i, layer in enumerate(self.layers):
@@ -203,19 +173,11 @@ class PanoOptiNetMixVisionTransformer(MixVisionTransformer):
                 x = layer[2](x)
                 x = nlc_to_nchw(x, hw_shape)
 
-                # our PanoOptiNet code: i = 0 时，表示第一层，此时需要处理重叠的部分
-                if (dx != 0 or dy != 0) and id != 1 and i == 0:
-                    if overlap is not None and overlap != []:
-                        # our PanoOptiNet code: 仅有当有光谱指导时才进行重叠部分的处理，否则按照正常的处理方式
-                        if dx != 0 or dy != 0:
-                            x = self.featureTemplatePaste(
-                                x, overlap, self.last_dx, self.last_dy, hw_shape
-                            )  # hw_shape=(128,128) (64,64) (32,32) (16,16)
+                # our PanoOptiNet code: 第一层（i==0）且有有效 recv_side 且非第一帧时，执行 FTP 注入
+                if i == 0 and recv_side != -1 and patch_id != 1 and overlap is not None:
+                    x = self.featureTemplatePaste(x, overlap, recv_side, hw_shape)
 
                 if i in self.out_indices:
                     outs.append(x)
-
-            self.last_dx = dx
-            self.last_dy = dy
 
             return outs

@@ -9,9 +9,10 @@ from ..builder import SEGMENTORS
 class PanoOptiNet_EncoderDecoder(EncoderDecoder):
     """基于继承的PanoOptiNet滑窗机制分割器，支持传递overlap信息。"""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, inference_tbti=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.overlap = None
+        self.inference_tbti = inference_tbti  # 推理时是否启用 TBTI（默认关闭）
 
     def extract_feat(self, img, img_metas, overlap):
         """从图像中提取特征，增加overlap参数用于特殊处理。"""
@@ -41,10 +42,16 @@ class PanoOptiNet_EncoderDecoder(EncoderDecoder):
         return losses
 
     def _decode_head_forward_test(self, x, img_metas):
-        """测试时的解码头前向传播，支持返回overlap。"""
+        """测试时的解码头前向传播。
+
+        当 inference_tbti=False（默认）时，不更新 self.overlap，
+        FTP 注入自动失效，避免推理时跨图像传递错误特征。
+        """
         seg_logits, overlap = self.decode_head.forward_test(
             x, img_metas, self.test_cfg)
-        self.overlap = overlap
+        if self.inference_tbti:
+            self.overlap = overlap
+        # inference_tbti=False 时，self.overlap 保持 None，FTP 不会被激活
         return seg_logits
 
     def forward_train(self, img, img_metas, gt_semantic_seg):
@@ -134,7 +141,6 @@ class PanoOptiNet_EncoderDecoder(EncoderDecoder):
         if self.test_cfg.mode == 'slide':
             seg_logit = self.slide_inference(img, img_meta, rescale)
         else:
-            img_meta.append(None)  # 避免报错
             seg_logit = self.whole_inference(img, img_meta, rescale)
         if self.out_channels == 1:
             output = torch.sigmoid(seg_logit)

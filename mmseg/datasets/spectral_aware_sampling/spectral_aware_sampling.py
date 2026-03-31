@@ -199,6 +199,8 @@ class SpectralAwareSampling():
         print(f'  【诊断结论】{diagnosis}')
         print(f'    {advice}')
         print(f'{sep}\n')
+
+    def find_first_region(self, image_array):
         """
         通过NDWI波段找到NDWI值最大的位置作为初始点。
         如果多个最大值相同，则随机选择一个最大值作为起点。
@@ -312,6 +314,10 @@ class SpectralAwareSampling():
             best_dx = best_dy = 0
         # ────────────────────────────────────────────────────────────────────────
 
+        # 在信息最充分时（SAS 阶段），将方向转换为几何边缘标识符，
+        # 避免下游模块在方向改变时用 last_dx/last_dy 间接推算而出错。
+        ftc_side, recv_side = self._direction_to_sides(best_dx, best_dy)
+
         if max_i_second != -9:  # 找到有效且高于阈值的区域时
             # 记录当前区域坐标并绘制绿色虚线边框
             self.path_coords.append((max_i_second, max_j_second))
@@ -330,11 +336,12 @@ class SpectralAwareSampling():
 
         visited_regions[max_i_second:max_i_second+self.region_size, max_j_second:max_j_second+self.region_size] = 1
         if max_i_second != -9:
-            print(f"[阶段2完成] 找到相邻区域: ({max_i_second}, {max_j_second})")
+            print(f"[阶段2完成] 找到相邻区域: ({max_i_second}, {max_j_second})，"
+                  f"ftc_side={ftc_side}，recv_side={recv_side}")
         else:
             print("[阶段2完成] 未找到有效相邻区域")
 
-        return max_i_first, max_j_first, max_i_second, max_j_second, visited_regions, best_dx, best_dy
+        return max_i_first, max_j_first, max_i_second, max_j_second, visited_regions, ftc_side, recv_side
     
     def save_gdal_image(self, image_array, index):
         driver = gdal.GetDriverByName('PNG')
@@ -360,9 +367,9 @@ class SpectralAwareSampling():
                     image_patch = image[:, start_y:start_y+self.region_size, start_x:start_x+self.region_size]
                     annotation_patch = annotation[:, start_y:start_y+self.region_size, start_x:start_x+self.region_size]
                     index += 1
-                    best_dx = best_dy = 0
-                    self.save_patch(image_patch, self.image_dir, index, best_dx, best_dy)
-                    self.save_patch(annotation_patch, self.annotation_dir, index, best_dx, best_dy)
+                    # 补充扫描段：无移动关系，ftc_side=-1, recv_side=-1
+                    self.save_patch(image_patch, self.image_dir, index, ftc_side=-1, recv_side=-1)
+                    self.save_patch(annotation_patch, self.annotation_dir, index, ftc_side=-1, recv_side=-1)
                 
                 # 更新进度条
                 processed_regions += 1
@@ -372,11 +379,43 @@ class SpectralAwareSampling():
         # 关闭进度条
         pbar.close()
 
-    def save_patch(self, patch, path, index, best_dx=0, best_dy=0):
+    @staticmethod
+    def _direction_to_sides(dx, dy):
         """
-        将图像块保存到指定目录
+        将移动方向 (dx, dy) 转换为 (ftc_side, recv_side)。
+
+        ftc_side：当前 patch 应在 FTC 阶段裁剪的边（前沿，即朝向下一个 patch 的那条边）
+        recv_side：下一个 patch 应在 FTP 阶段接收注入的边（后沿，即与当前 patch 接触的那条边）
+        两者互为对边，由 SAS 在信息最充分时直接计算，避免下游用 dx/dy 间接推算。
+
+        编码：0=底 1=顶 2=右 3=左 4=右下角 5=左下角 6=右上角 7=左上角 -1=无移动
+        对边映射：{0↔1, 2↔3, 4↔7, 5↔6}
         """
-        filename = self.image_name + "/" + self.image_name + f"_{index}" + f"_{best_dx}_{best_dy}.png"
+        _opposite = {0: 1, 1: 0, 2: 3, 3: 2, 4: 7, 7: 4, 5: 6, 6: 5, -1: -1}
+        _dir_to_ftc = {
+            (1,  0): 0,   # 向下前进 → 前沿在底部
+            (-1, 0): 1,   # 向上前进 → 前沿在顶部
+            (0,  1): 2,   # 向右前进 → 前沿在右侧
+            (0, -1): 3,   # 向左前进 → 前沿在左侧
+            (1,  1): 4,   # 向右下   → 前沿在右下角
+            (1, -1): 5,   # 向左下   → 前沿在左下角
+            (-1, 1): 6,   # 向右上   → 前沿在右上角
+            (-1,-1): 7,   # 向左上   → 前沿在左上角
+            (0,  0): -1,  # 无移动
+        }
+        ftc_side = _dir_to_ftc.get((dx, dy), -1)
+        recv_side = _opposite[ftc_side]
+        return ftc_side, recv_side
+
+    def save_patch(self, patch, path, index, ftc_side=-1, recv_side=-1):
+        """
+        将图像块保存到指定目录。
+
+        文件名格式：<name>/<name>_<id>_<ftc_side>_<recv_side>.png
+          ftc_side：本 patch 的 FTC 裁剪边（-1 表示无移动）
+          recv_side：本 patch 的 FTP 接收边（-1 表示无移动）
+        """
+        filename = self.image_name + "/" + self.image_name + f"_{index}" + f"_{ftc_side}_{recv_side}.png"
         save_path = os.path.join(path, filename)
         if path == self.image_dir:
             self.image_list = dict(filename=filename)
@@ -384,54 +423,63 @@ class SpectralAwareSampling():
             self.image_info_list.append(self.image_list)
         if os.path.exists(save_path):
             return
-        patch = patch.transpose(1, 2, 0)
+        patch = patch.transpose(1, 2, 0)  # (C,H,W) → (H,W,C)，此时通道顺序仍为 GDAL 原始顺序（RGB）
+        patch = patch[:, :, ::-1].copy()   # RGB → BGR，与 cv2.imwrite 的写入约定对齐
         if not os.path.exists(os.path.dirname(save_path)):
             os.makedirs(os.path.dirname(save_path))
         cv2.imwrite(save_path, patch)
        
-    def recursive_segmentation(self, max_i_first, max_j_first, visited_regions, image, annotation, index, prev_max_i_second=None, prev_max_j_second=None):
+    def recursive_segmentation(self, max_i_first, max_j_first, visited_regions, image, annotation, index, prev_max_i_second=None, prev_max_j_second=None, prev_recv_side=-1):
         """
         递归的调用find_second_region函数，
         通过find_second_region函数找到下一个最大值的坐标，
         并保存图像块。
+
+        prev_recv_side：上一次 find_second_region 返回的 recv_side，
+                        即本次要保存的 patch 的 FTP 接收边编码。
         """
         if index >= self.max_iterations:
             print("[递归阶段] 达到最大迭代次数，开始处理剩余区域")
             self.pre_seg(visited_regions, image, annotation, index)
             return
-        
+
         # 初始化进度条
         if index == 1:
             self.pbar = tqdm(total=self.max_iterations, desc='分割进度', unit='iter')
-        
+
         # 更新进度条
         self.pbar.update(1)
         self.pbar.set_postfix({'当前迭代': index})
 
-        max_i_first, max_j_first, max_i_second, max_j_second, visited_regions, best_dx, best_dy = self.find_second_region(self.image, max_i_first, max_j_first, visited_regions)
+        max_i_first, max_j_first, max_i_second, max_j_second, visited_regions, ftc_side, recv_side = self.find_second_region(self.image, max_i_first, max_j_first, visited_regions)
 
         if max_i_second == -9:
+            # 无有效邻域：将上一帧位置以 ftc_side=-1/recv_side=prev_recv_side 保存后终止
             second_region_rgb = image[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
             second_region_annotation = annotation[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-            self.save_patch(second_region_rgb, self.image_dir, index, best_dx, best_dy)
-            self.save_patch(second_region_annotation, self.annotation_dir, index, best_dx, best_dy)
+            self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=-1, recv_side=prev_recv_side)
+            self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=-1, recv_side=prev_recv_side)
             print("[递归阶段] 未找到有效相邻区域，开始处理剩余区域")
             self.pre_seg(visited_regions, image, annotation, index)
             return
 
         if prev_max_i_second is not None:
+            # 保存上一帧 patch：
+            #   ftc_side = 本次搜索得到的 ftc_side（上一帧应裁剪的前沿边）
+            #   recv_side = 上一次传入的 prev_recv_side（上一帧应接收注入的后沿边）
             second_region_rgb = image[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
             second_region_annotation = annotation[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-            self.save_patch(second_region_rgb, self.image_dir, index, best_dx, best_dy)
-            self.save_patch(second_region_annotation, self.annotation_dir, index, best_dx, best_dy)
+            self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=prev_recv_side)
+            self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=ftc_side, recv_side=prev_recv_side)
 
         if index == 1:
+            # 第一个 patch：无前驱，recv_side=-1；ftc_side 由本次搜索决定
             first_region_rgb = image[:, max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size]
             first_region_annotation = annotation[:, max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size]
-            self.save_patch(first_region_rgb, self.image_dir, index, best_dx, best_dy)
-            self.save_patch(first_region_annotation, self.annotation_dir, index, best_dx, best_dy)
+            self.save_patch(first_region_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=-1)
+            self.save_patch(first_region_annotation, self.annotation_dir, index, ftc_side=ftc_side, recv_side=-1)
 
-        self.recursive_segmentation(max_i_second, max_j_second, visited_regions, image, annotation, index+1, max_i_second, max_j_second)
+        self.recursive_segmentation(max_i_second, max_j_second, visited_regions, image, annotation, index+1, max_i_second, max_j_second, prev_recv_side=recv_side)
 
     def main(self):
         image_rgb = self.image[:3,:,:] 
