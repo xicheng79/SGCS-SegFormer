@@ -242,6 +242,8 @@ class SpectralAwareSampling():
         mean_sum = float(np.mean(all_region_sums))
         std_sum  = float(np.std(all_region_sums))
         self.ndwi_threshold = mean_sum + self.ndwi_threshold_k * std_sum
+        # 保存全图最大 NDWI 区域和，用于多段搜索时计算新段启动阈值 T_water
+        self.max_ndwi_sum = max_sum_first
 
         # 打印增强诊断报告（含量纲识别、阈值分析、调参建议）
         self._print_threshold_diagnosis(mean_sum, std_sum, all_region_sums)
@@ -429,7 +431,7 @@ class SpectralAwareSampling():
             os.makedirs(os.path.dirname(save_path))
         cv2.imwrite(save_path, patch)
        
-    def recursive_segmentation(self, max_i_first, max_j_first, visited_regions, image, annotation, index, prev_max_i_second=None, prev_max_j_second=None, prev_recv_side=-1):
+    def recursive_segmentation(self, max_i_first, max_j_first, visited_regions, image, annotation, index, prev_max_i_second=None, prev_max_j_second=None, prev_recv_side=-1, skip_pre_seg=False, is_segment_start=False):
         """
         递归的调用find_second_region函数，
         通过find_second_region函数找到下一个最大值的坐标，
@@ -437,14 +439,21 @@ class SpectralAwareSampling():
 
         prev_recv_side：上一次 find_second_region 返回的 recv_side，
                         即本次要保存的 patch 的 FTP 接收边编码。
+        skip_pre_seg：若为 True，段终止时不调用 pre_seg，而是将终止 index
+                      存入 self._segment_end_index 后返回（用于多段搜索）。
+        is_segment_start：若为 True，视为新段起点，保存起点 patch（recv_side=-1）。
         """
         if index >= self.max_iterations:
+            self._segment_end_index = index
+            if skip_pre_seg:
+                print("[递归阶段] 达到最大迭代次数，当前段终止")
+                return
             print("[递归阶段] 达到最大迭代次数，开始处理剩余区域")
             self.pre_seg(visited_regions, image, annotation, index)
             return
 
         # 初始化进度条
-        if index == 1:
+        if index == 1 or is_segment_start:
             self.pbar = tqdm(total=self.max_iterations, desc='分割进度', unit='iter')
 
         # 更新进度条
@@ -455,10 +464,15 @@ class SpectralAwareSampling():
 
         if max_i_second == -9:
             # 无有效邻域：将上一帧位置以 ftc_side=-1/recv_side=prev_recv_side 保存后终止
-            second_region_rgb = image[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-            second_region_annotation = annotation[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-            self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=-1, recv_side=prev_recv_side)
-            self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=-1, recv_side=prev_recv_side)
+            if prev_max_i_second is not None:
+                second_region_rgb = image[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
+                second_region_annotation = annotation[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
+                self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=-1, recv_side=prev_recv_side)
+                self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=-1, recv_side=prev_recv_side)
+            self._segment_end_index = index
+            if skip_pre_seg:
+                print("[递归阶段] 未找到有效相邻区域，当前段终止")
+                return
             print("[递归阶段] 未找到有效相邻区域，开始处理剩余区域")
             self.pre_seg(visited_regions, image, annotation, index)
             return
@@ -472,35 +486,192 @@ class SpectralAwareSampling():
             self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=prev_recv_side)
             self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=ftc_side, recv_side=prev_recv_side)
 
-        if index == 1:
-            # 第一个 patch：无前驱，recv_side=-1；ftc_side 由本次搜索决定
+        if index == 1 or is_segment_start:
+            # 段起始 patch：无前驱，recv_side=-1；ftc_side 由本次搜索决定
             first_region_rgb = image[:, max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size]
             first_region_annotation = annotation[:, max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size]
             self.save_patch(first_region_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=-1)
             self.save_patch(first_region_annotation, self.annotation_dir, index, ftc_side=ftc_side, recv_side=-1)
 
-        self.recursive_segmentation(max_i_second, max_j_second, visited_regions, image, annotation, index+1, max_i_second, max_j_second, prev_recv_side=recv_side)
+        self.recursive_segmentation(max_i_second, max_j_second, visited_regions, image, annotation, index+1, max_i_second, max_j_second, prev_recv_side=recv_side, skip_pre_seg=skip_pre_seg)
 
-    def main(self):
-        image_rgb = self.image[:3,:,:] 
+    def _find_new_isp(self, visited_regions, t_water):
+        """
+        重扫全图，在未访问区域中找到 NDWI 区域和最高且超过 T_water 的窗口，
+        作为新段主搜索起点（ISP, Initial Starting Point）。
+
+        复用已有积分图，额外计算量为 O(1) 查询 × 窗口总数。
+
+        参数：
+            visited_regions: 已访问区域矩阵
+            t_water: 新段启动阈值，用于拦截道路伪高 NDWI 窗口
+
+        返回：
+            (best_i, best_j): 新 ISP 坐标；若无合适窗口则返回 (-9, -9)
+        """
+        best_sum = -1e9
+        best_i, best_j = -9, -9
+
+        for i in range(0, self.height - self.region_size + 1, self.region_size - self.shift_size):
+            for j in range(0, self.width - self.region_size + 1, self.region_size - self.shift_size):
+                # 跳过已完全访问的窗口
+                if visited_regions[i:i+self.region_size, j:j+self.region_size].sum() == self.region_size * self.region_size:
+                    continue
+                region_sum = self.get_region_sum(i, j)
+                if region_sum > t_water and region_sum > best_sum:
+                    best_sum = region_sum
+                    best_i, best_j = i, j
+
+        return best_i, best_j
+
+    def sgsw_single_segment(self):
+        """
+        原始单段主搜索方法（动态阈值法）。
+
+        流程：find_first_region → recursive_segmentation → pre_seg
+        特点：单段贪心搜索，第一段终止后直接进入补充扫描。
+        适用：水体集中于单一连通区域的场景。
+        """
+        image_rgb = self.image[:3,:,:]
         annotation = gdal.Open(self.annotation_path)
         annotation = annotation.ReadAsArray()
         annotation = np.expand_dims(annotation, axis=0)
-        max_i_first, max_j_first, visited_regions = self.find_first_region(self.image)   
+        max_i_first, max_j_first, visited_regions = self.find_first_region(self.image)
         self.recursive_segmentation(max_i_first, max_j_first, visited_regions, image_rgb, annotation, 1)
-        
+
         # 关闭进度条
         if hasattr(self, 'pbar'):
             self.pbar.close()
-        
-        # 新增：创建示意图目录（若不存在）
+
+    def sgsw_multi_segment(self, max_segments=None, alpha=0.4):
+        """
+        多段主搜索方法（连通域感知）。
+
+        流程：find_first_region → [recursive_segmentation → 重扫找新ISP] × N → pre_seg
+
+        核心改进：
+        - 每段终止后不立即进入补充扫描，而是重扫全图寻找未覆盖的高 NDWI 区域
+        - 双阈值设计：T_expand（段内扩展，现有 ndwi_threshold）+ T_water（新段启动）
+        - T_water 基于 ndwi_zero_sum 锚定，有效过滤道路伪高 NDWI 窗口
+        - 段间跳跃天然使用 ftc_side=-1, recv_side=-1，TBTI 自动禁用
+
+        参数：
+            max_segments (int or None): 最大搜索段数。
+                None = 自适应，直到全图所有高 NDWI 区域覆盖；
+                N = 固定 N 段后进入补充扫描。
+            alpha (float): T_water 计算系数，默认 0.4。
+                T_water = ndwi_zero_sum + α × (max_ndwi_sum - ndwi_zero_sum)
+                α 越大，新段启动要求越高，对道路过滤越严格。
+                建议范围 [0.3, 0.5]。
+        """
+        image_rgb = self.image[:3,:,:]
+        annotation = gdal.Open(self.annotation_path)
+        annotation = annotation.ReadAsArray()
+        annotation = np.expand_dims(annotation, axis=0)
+
+        # 第一段 ISP
+        max_i, max_j, visited_regions = self.find_first_region(self.image)
+
+        # ── 计算新段启动阈值 T_water ──────────────────────────────────────────
+        t_water = self.ndwi_zero_sum + alpha * (self.max_ndwi_sum - self.ndwi_zero_sum)
+        window_pixels = self.region_size * self.region_size
+        t_water_pixel = t_water / window_pixels
+        sep = '─' * 60
+        print(f'\n{sep}')
+        print(f'[SGSW 多段搜索] 双阈值配置：')
+        print(f'  T_expand（段内扩展阈值）= {self.ndwi_threshold:.2f}'
+              f'  （对应像素均值 {self.ndwi_threshold / window_pixels:.2f}）')
+        print(f'  T_water （新段启动阈值）= {t_water:.2f}'
+              f'  （对应像素均值 {t_water_pixel:.2f}, α={alpha}）')
+        print(f'  max_segments = {max_segments if max_segments is not None else "自适应"}')
+        print(f'{sep}\n')
+
+        segment_count = 0
+        index = 1
+
+        while True:
+            segment_count += 1
+            print(f'\n[多段搜索] ═══ 启动第 {segment_count} 段主搜索 ═══'
+                  f'  ISP=({max_i}, {max_j})')
+
+            # 运行当前段的递归分割（不调用 pre_seg）
+            self._segment_end_index = index
+            is_first_segment = (segment_count == 1)
+            self.recursive_segmentation(
+                max_i, max_j, visited_regions, image_rgb, annotation, index,
+                skip_pre_seg=True,
+                is_segment_start=(not is_first_segment)
+            )
+
+            # 关闭当前段的进度条
+            if hasattr(self, 'pbar'):
+                self.pbar.close()
+
+            index = self._segment_end_index
+
+            # 检查是否达到段数上限
+            if max_segments is not None and segment_count >= max_segments:
+                print(f'[多段搜索] 达到最大段数 {max_segments}，进入补充扫描')
+                break
+
+            # 重扫全图寻找新 ISP
+            new_i, new_j = self._find_new_isp(visited_regions, t_water)
+            if new_i == -9:
+                print('[多段搜索] 全图所有高 NDWI 区域已覆盖，进入补充扫描')
+                break
+
+            new_sum = self.get_region_sum(new_i, new_j)
+            new_pixel = new_sum / window_pixels
+            print(f'[多段搜索] 发现新 ISP: ({new_i}, {new_j})，'
+                  f'NDWI 区域和={new_sum:.2f}（像素均值={new_pixel:.2f}）')
+
+            # 标记新 ISP 为已访问
+            visited_regions[new_i:new_i+self.region_size,
+                            new_j:new_j+self.region_size] = 1
+            # 在示意图上标记新段起点（橙色边框 + 段号标签）
+            self.path_coords.append((new_i, new_j))
+            x, y = new_j, new_i
+            w, h = self.region_size, self.region_size
+            cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h),
+                          (0, 165, 255), 3)  # 橙色 (BGR)
+            cv2.putText(self.schematic_img, f'S{segment_count+1}',
+                        (x + 10, y + 60), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2, (0, 165, 255), 2)
+
+            max_i, max_j = new_i, new_j
+            index += 1  # 新段从下一个 index 开始
+
+        # 全部主搜索段完成后，进入补充扫描
+        self.pre_seg(visited_regions, image_rgb, annotation, index)
+
+    def main(self, method='multi_segment', max_segments=2, alpha=0.4):
+        """
+        SGSW 主入口。
+
+        参数：
+            method (str): 搜索方法选择。
+                'single_segment' — 原始单段主搜索（动态阈值法）
+                'multi_segment'  — 多段主搜索（连通域感知，默认）
+            max_segments (int or None): 多段搜索时的最大段数（仅 multi_segment 有效）。
+                None = 自适应；N = 固定 N 段。默认 2。
+            alpha (float): 多段搜索的 T_water 系数（仅 multi_segment 有效）。
+                默认 0.4。
+        """
+        if method == 'single_segment':
+            self.sgsw_single_segment()
+        elif method == 'multi_segment':
+            self.sgsw_multi_segment(max_segments=max_segments, alpha=alpha)
+        else:
+            raise ValueError(f"未知的 SGSW 方法: {method}，"
+                             f"可选: 'single_segment', 'multi_segment'")
+
+        # 保存示意图
         os.makedirs(self.schematic_dir, exist_ok=True)
-        # 新增：生成带有序号的文件名（根据当前目录已有文件数量递增）
         existing_files = [f for f in os.listdir(self.schematic_dir) if f.startswith(f"{self.image_name}_schematic_")]
         schematic_num = len(existing_files) + 1
         schematic_path = os.path.join(self.schematic_dir, f"{self.image_name}_schematic_{schematic_num}.png")
-        cv2.imwrite(schematic_path, self.schematic_img)  # 保存示意图到新路径
-        
+        cv2.imwrite(schematic_path, self.schematic_img)
+
         return self.image_info_list
     
     def calculate_integral_image(self, ndvi):
