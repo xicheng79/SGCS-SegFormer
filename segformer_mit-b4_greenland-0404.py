@@ -32,13 +32,21 @@ model = dict(
         num_classes=2,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
         align_corners=False,
-        loss_decode=dict(
-            type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)),
+        loss_decode=[
+            dict(
+                type='CrossEntropyLoss',
+                use_sigmoid=False,
+                class_weight=[0.3, 0.7],
+                loss_weight=1.0),
+            dict(
+                type='DiceLoss',
+                loss_weight=1.0)]),
     train_cfg=dict(),
-    test_cfg=dict(mode='slide', crop_size=(512, 512), stride=(341, 341)))
+    test_cfg=dict(mode='slide', crop_size=(512, 512), stride=(256, 256)))
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations'),
+    dict(type='PhotoMetricDistortion'),
     dict(
         type='Normalize',
         mean=[33.0, 33.17, 29.615],
@@ -77,6 +85,7 @@ data = dict(
         pipeline=[
             dict(type='LoadImageFromFile'),
             dict(type='LoadAnnotations'),
+            dict(type='PhotoMetricDistortion'),
             dict(
                 type='Normalize',
                 mean=[33.0, 33.17, 29.615],
