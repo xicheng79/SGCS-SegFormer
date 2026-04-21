@@ -6,694 +6,659 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 
-# 用于进行图像分割, 这个类的输入是图像的路径，标注的路径，图像的信息列表，输出是图像的分割结果`,用NDWI作为指标，用最大和作为选择标准
-class SpectralAwareSampling():
+
+class WindowNode:
+    """窗口节点，用于DFS遍历"""
+    def __init__(self, i, j, ndwi_sum, direction=None):
+        self.i = i
+        self.j = j
+        self.ndwi_sum = ndwi_sum
+        self.direction = direction
+
+
+class ForkPoint:
+    """分叉点，用于回溯"""
+    def __init__(self, i, j, unexplored_neighbors):
+        self.i = i
+        self.j = j
+        self.unexplored = unexplored_neighbors
+
+
+class SpectralAwareSampling:
     def __init__(self, image_path, annotation_path, image_info_list,
-                 ndwi_threshold_k=0.0):
+                 ndwi_threshold_k=0.0,
+                 label_validation_enabled=True,
+                 seed_water_ratio_threshold=0.3,
+                 new_isp_water_ratio_threshold=0.2,
+                 path_water_ratio_threshold=0.2,
+                 top_k_candidates=100,
+                 max_tolerance_steps=2,
+                 tolerance_ratio=0.75):
         """
-        Constructor method
+        基于深度优先搜索的光谱感知采样
 
         参数：
-            image_path (str): 输入影像路径（多波段，最后一波段为NDWI）。
-            annotation_path (str): 标注掩码路径。
-            image_info_list (list): 用于收集输出的图像信息列表。
-            ndwi_threshold_k (float): 相对阈值系数，默认 0.0。
-                主搜索终止阈值 = mean(所有候选窗口NDWI和) + k * std(...)。
-                k=0.0：均值截断，仅让高于平均NDWI水平的窗口进入主搜索段（推荐起点）；
-                k>0.0：更严格，仅保留高于均值+k倍标准差的高NDWI区域进入主搜索段；
-                k<0.0：更宽松，允许低于均值的窗口也进入主搜索段。
+            image_path (str): 输入影像路径（多波段，最后一波段为NDWI）
+            annotation_path (str): 标注掩码路径
+            image_info_list (list): 用于收集输出的图像信息列表
+            ndwi_threshold_k (float): 相对阈值系数，默认 0.0
+            label_validation_enabled (bool): 是否启用标注验证，默认 True
+            seed_water_ratio_threshold (float): 种子点水体占比阈值，默认 0.3
+            new_isp_water_ratio_threshold (float): 新段ISP水体占比阈值，默认 0.2
+            path_water_ratio_threshold (float): 路径水体占比阈值，默认 0.2
+            top_k_candidates (int): Top-K 候选数量
+            max_tolerance_steps (int): 最大容忍窗口数，默认 2
+            tolerance_ratio (float): 容忍阈值系数（相对于ndwi_threshold），默认 0.75
         """
         self.annotation_path = annotation_path
         self.image_path = image_path
         self.image = gdal.Open(image_path).ReadAsArray()
         self.height, self.width = self.image.shape[-2:]
         self.num_bands = self.image.shape[0]
-        self.shift_size = 128 # 这个是按经验定的，可能需要调整
-        self.region_size = 512 # 这个是按经验定的，可能需要调整
-        self.image_dir = r'mydata\greenland_ndvi_3968x3968_test\JPEGImages' # 这个路径下的图片都是3968x3968的PNG图片，第四个波段下是NDVI波段。
-        self.annotation_dir = r'mydata\greenland_ndvi_3968x3968_test\SegmentationClass' # 这个路径下的图片都是3968x3968的PNG图片，是标注的图片。
-        # 新增：初始化示意图存储目录（在image_dir下创建schematic子文件夹）
-        self.schematic_dir = os.path.join(self.image_dir, 'schematic')
+        self.shift_size = 128
+        self.region_size = 512
+        self.image_dir = r'D:\dataset\water_ndwi_3968_0907\JPEGImages'
+        self.annotation_dir = r'D:\dataset\water_ndwi_3968_0907\SegmentationClass'
+        self.schematic_dir = os.path.join(self.image_dir, 'schematic_dfs4')
         self.image_name = os.path.splitext(os.path.basename(image_path))[0]
         self.image_list = []
         self.image_info_list = image_info_list
         self.max_iterations = 100
-        self.ndwi_band = self.image[-1,:,:]  # 提取NDWI波段（最后一波段）
+        self.ndwi_band = self.image[-1, :, :]
         self.integral_image = self.calculate_integral_image(self.ndwi_band)
-        self.path_coords = []  # 记录路径中的区域左上角坐标(i, j)
-        # 相对阈值系数（由外部传入）
+        self.path_coords = []
+
         self.ndwi_threshold_k = ndwi_threshold_k
-        # 主搜索终止阈值：由 find_first_region 遍历所有候选窗口后统计计算，
-        # 公式为 mean + k * std（基于全图所有候选窗口的NDWI区域和）。
-        # 初始化为 None；find_second_region 在此值为 None 时会跳过阈值判断。
+        self.label_validation_enabled = label_validation_enabled
+        self.seed_water_ratio_threshold = seed_water_ratio_threshold
+        self.new_isp_water_ratio_threshold = new_isp_water_ratio_threshold
+        self.path_water_ratio_threshold = path_water_ratio_threshold
+        self.top_k_candidates = top_k_candidates
+
+        self.max_tolerance_steps = max_tolerance_steps
+        self.tolerance_ratio = tolerance_ratio
+
         self.ndwi_threshold = None
-        # 量纲检测：自动识别 NDWI 波段的数值范围，计算物理水体分界零点
-        # 对应的窗口区域和，用于增强输出诊断。
+        self.tolerance_threshold = None
         self.ndwi_scale, self.ndwi_zero_sum = self._detect_ndwi_scale()
-        # 初始化示意图（使用前3波段作为基础图，转换为HWC格式的BGR图像）
+
         self.schematic_img = self.image[:3, :, :].transpose(1, 2, 0).copy()
-        if self.schematic_img.dtype != np.uint8:  # 确保是uint8格式
+        if self.schematic_img.dtype != np.uint8:
             self.schematic_img = (self.schematic_img * 255).astype(np.uint8)
-        
-        # 添加一个检查函数检查image_dir和annotation_dir在本机上是否存在的函数，不存在这报为正确配置presegmentation.py下的image_dir和annotation_dir未配置正确的错误
+
+        self.saved_coords = set()
+
         self.check_directories()
-        
+
     def check_directories(self):
         if not os.path.exists(self.image_dir) or not os.path.exists(self.annotation_dir):
-            raise RuntimeError("请检查sgsw.py 下的 image_dir 和 annotation_dir 配置是否正确，如果路径正确仍然有错请检查是否正确挂载代码到环境。")
+            raise RuntimeError("请检查dfs_sgsw.py下的image_dir和annotation_dir配置是否正确")
 
     def _detect_ndwi_scale(self):
-        """
-        自动检测 NDWI 波段的数值量纲，计算物理水体分界零点对应的窗口区域和。
-
-        NDWI 在不同处理流程下可能以三种量纲存储：
-          - [-1, 1]  浮点数：原始物理值，水体分界 NDWI=0，区域和零点 = 0
-          - [0, 1]   归一化浮点：线性映射，NDWI=0 对应像素值 0.5，
-                     区域和零点 = 0.5 × region_size²
-          - [0, 255] 拉伸整数：常见遥感产品存储格式，NDWI=0 对应像素值 127.5，
-                     区域和零点 = 127.5 × region_size²
-
-        检测方法：直接读取 NDWI 波段的最小值和最大值，根据数值范围判断量纲。
-        这是最直接可靠的方法，不依赖任何分布假设。
-
-        返回：
-            scale (str): 量纲标识，'float_signed' / 'float_normalized' / 'uint8'
-            zero_sum (float): 物理水体分界零点（NDWI=0）对应的窗口区域和
-        """
         ndwi_min = float(self.ndwi_band.min())
         ndwi_max = float(self.ndwi_band.max())
         window_pixels = self.region_size * self.region_size
 
         if ndwi_min < -0.01:
-            # 存在负值 → [-1, 1] 原始浮点量纲
             scale = 'float_signed'
-            # NDWI=0 时窗口内所有像素均为 0，区域和为 0
             zero_pixel = 0.0
         elif ndwi_max <= 1.01:
-            # 范围在 [0, 1] 内 → 归一化浮点
-            # 原始 NDWI=0 经 (x+1)/2 映射后为 0.5
             scale = 'float_normalized'
             zero_pixel = 0.5
         else:
-            # 最大值超过 1 → [0, 255] 拉伸整数
-            # 原始 NDWI=0 经 (x+1)/2×255 映射后为 127.5
             scale = 'uint8'
             zero_pixel = 127.5
 
         zero_sum = zero_pixel * window_pixels
         return scale, zero_sum
 
-    def _print_threshold_diagnosis(self, mean_sum, std_sum, all_region_sums):
-        """
-        打印增强的阈值诊断信息。
+    def _validate_seed_with_label(self, i, j, water_ratio_threshold=None):
+        if not self.label_validation_enabled:
+            return True, 1.0
+
+        if water_ratio_threshold is None:
+            water_ratio_threshold = self.seed_water_ratio_threshold
+
+        if not hasattr(self, '_annotation_array'):
+            try:
+                annotation_ds = gdal.Open(self.annotation_path)
+                if annotation_ds is None:
+                    print(f"[警告] 无法打开标注文件: {self.annotation_path}, 禁用标注验证")
+                    self.label_validation_enabled = False
+                    return True, 1.0
+
+                self._annotation_array = annotation_ds.ReadAsArray()
+                if len(self._annotation_array.shape) == 3:
+                    self._annotation_array = self._annotation_array[0]
+
+                if self._annotation_array.max() > 1:
+                    self._annotation_array = (self._annotation_array > 0).astype(np.float32)
+
+            except Exception as e:
+                print(f"[警告] 标注数据加载失败: {e}, 禁用标注验证")
+                self.label_validation_enabled = False
+                return True, 1.0
+
+        window_label = self._annotation_array[
+            i:i+self.region_size,
+            j:j+self.region_size
+        ]
+
+        water_ratio = float(window_label.mean())
+        is_valid = water_ratio >= water_ratio_threshold
+
+        return is_valid, water_ratio
 
-        输出内容：
-          1. 量纲识别结果（数值范围及判断依据）
-          2. 全图候选窗口 NDWI 区域和的统计信息
-          3. 当前阈值与物理水体分界零点的相对位置
-          4. 超过/低于阈值的窗口数量及占比（即实际进入主搜索段的比例）
-          5. 基于上述信息的 k 值调参建议
-
-        参数：
-            mean_sum (float): 所有候选窗口 NDWI 区域和的均值
-            std_sum  (float): 所有候选窗口 NDWI 区域和的标准差
-            all_region_sums (np.ndarray): 所有候选窗口的 NDWI 区域和列表
-        """
-        threshold = self.ndwi_threshold
-        window_pixels = self.region_size * self.region_size
-        total_windows = len(all_region_sums)
-
-        # ── 1. 量纲信息 ──────────────────────────────────────────────────────
-        scale_desc = {
-            'float_signed':    '[-1, 1] 原始浮点（物理NDWI值）',
-            'float_normalized': '[0, 1]  归一化浮点（NDWI=0 对应像素值 0.5）',
-            'uint8':           '[0, 255] 拉伸整数（NDWI=0 对应像素值 127.5）',
-        }[self.ndwi_scale]
-
-        # ── 2. 像素均值（将区域和还原为单像素均值，更直观）────────────────────
-        mean_pixel = mean_sum / window_pixels
-        threshold_pixel = threshold / window_pixels
-        zero_pixel = self.ndwi_zero_sum / window_pixels
-
-        # ── 3. 超过阈值的窗口数量（即将进入主搜索段的窗口数）─────────────────
-        above_threshold = int(np.sum(all_region_sums >= threshold))
-        above_ratio = above_threshold / total_windows * 100
-
-        # ── 4. threshold 与物理零点的偏差程度（以 std 为单位）────────────────
-        if std_sum > 0:
-            deviation_sigmas = (threshold - self.ndwi_zero_sum) / std_sum
-        else:
-            deviation_sigmas = float('inf')
-
-        # ── 5. 调参建议逻辑 ──────────────────────────────────────────────────
-        # 核心判断：threshold 相对于物理零点的位置
-        #   threshold >> zero_sum → 阈值过高，主搜索段覆盖窗口过少，
-        #                           可能漏掉部分水体区域 → 建议减小 k
-        #   threshold ≈ zero_sum  → 阈值合理，主搜索段与水体区域基本对齐
-        #   threshold << zero_sum → 阈值过低，主搜索段纳入了大量非水体窗口 → 建议增大 k
-        if deviation_sigmas > 1.0:
-            diagnosis = '⚠ 阈值偏高'
-            advice = (f'当前阈值高于物理水体零点 {deviation_sigmas:.1f}σ，'
-                      f'主搜索段可能过于保守（仅覆盖 {above_ratio:.1f}% 的窗口），'
-                      f'部分水体区域可能被划入补充扫描段，减少 TBTI 训练机会。\n'
-                      f'    建议：适当减小 ndwi_threshold_k'
-                      f'（如 k={self.ndwi_threshold_k - 0.5:.1f} 或更小）。')
-        elif deviation_sigmas < -1.0:
-            diagnosis = '⚠ 阈值偏低'
-            advice = (f'当前阈值低于物理水体零点 {abs(deviation_sigmas):.1f}σ，'
-                      f'主搜索段覆盖了 {above_ratio:.1f}% 的窗口，其中可能包含'
-                      f'大量非水体区域，导致 TBTI 在语义断裂处被激活。\n'
-                      f'    建议：适当增大 ndwi_threshold_k'
-                      f'（如 k={self.ndwi_threshold_k + 0.5:.1f} 或更大）。')
-        else:
-            diagnosis = '✓ 阈值合理'
-            advice = (f'当前阈值与物理水体零点偏差在 1σ 以内（{deviation_sigmas:+.2f}σ），'
-                      f'主搜索段覆盖 {above_ratio:.1f}% 的窗口，与水体区域基本对齐，'
-                      f'k={self.ndwi_threshold_k} 当前设置合理。')
-
-        # ── 打印 ──────────────────────────────────────────────────────────────
-        sep = '─' * 60
-        print(f'\n{sep}')
-        print(f'[SGSW 阈值诊断报告]')
-        print(f'{sep}')
-        print(f'  【量纲识别】')
-        print(f'    NDWI 波段数值范围: [{self.ndwi_band.min():.3f}, {self.ndwi_band.max():.3f}]')
-        print(f'    判断量纲: {scale_desc}')
-        print(f'    物理水体分界（NDWI=0）对应像素值: {zero_pixel:.2f}')
-        print(f'    物理水体分界对应窗口区域和: {self.ndwi_zero_sum:.2f}')
-        print(f'{sep}')
-        print(f'  【全图候选窗口 NDWI 统计】')
-        print(f'    候选窗口总数: {total_windows}')
-        print(f'    窗口区域和  均值 (mean): {mean_sum:.2f}  '
-              f'→ 单像素均值: {mean_pixel:.4f}')
-        print(f'    窗口区域和  标准差 (std): {std_sum:.2f}')
-        print(f'{sep}')
-        print(f'  【当前阈值信息】')
-        print(f'    k = {self.ndwi_threshold_k}')
-        print(f'    threshold = mean + k×std = {threshold:.2f}  '
-              f'→ 对应单像素均值: {threshold_pixel:.4f}')
-        print(f'    threshold 与物理零点偏差: {deviation_sigmas:+.2f}σ')
-        print(f'    高于阈值的窗口数: {above_threshold} / {total_windows} '
-              f'({above_ratio:.1f}%)  ← 此比例的窗口将进入主搜索段')
-        print(f'{sep}')
-        print(f'  【诊断结论】{diagnosis}')
-        print(f'    {advice}')
-        print(f'{sep}\n')
-
-    def find_first_region(self, image_array):
-        """
-        通过NDWI波段找到NDWI值最大的位置作为初始点。
-        如果多个最大值相同，则随机选择一个最大值作为起点。
-
-        【新增】同步计算全局相对阈值 self.ndwi_threshold：
-            在遍历所有候选窗口时顺带收集每个窗口的NDWI区域和，
-            全部遍历后计算 mean + k * std，赋值给 self.ndwi_threshold，
-            供 find_second_region 作为主搜索终止判断的依据。
-            此步骤复用了积分图遍历，不引入额外的时间复杂度。
-
-        返回：
-            max_i_first: 最大NDWI值区域的行索引
-            max_j_first: 最大NDWI值区域的列索引
-            visited_regions: 用于记录已经访问过的区域的矩阵
-        """
-        print("[阶段1] 开始寻找初始区域并计算全局NDWI阈值...")
-        ndwi_band = image_array[-1,:,:]
-        visited_regions = np.zeros_like(ndwi_band)
-        max_sum_first = -19e9
-        max_positions = []  # 用来存储最大NDWI值位置
-
-        # 收集所有候选窗口的NDWI区域和，用于后续统计阈值
-        all_region_sums = []
-
-        for i in range(0, self.height - self.region_size + 1, self.region_size - self.shift_size):
-            for j in range(0, self.width - self.region_size + 1, self.region_size - self.shift_size):
-                region_sum = self.get_region_sum(i, j)
-                all_region_sums.append(region_sum)
-
-                if region_sum > max_sum_first:
-                    max_sum_first = region_sum
-                    max_positions = [(i, j)]  # 重新开始存储位置
-                elif region_sum == max_sum_first:
-                    max_positions.append((i, j))  # 添加相同NDWI值的位置
-
-        # 计算全局相对阈值：mean + k * std（基于所有候选窗口的NDWI区域和）
-        # 该阈值与窗口面积无关，直接对区域和进行统计，便于与 get_region_sum 的返回值直接比较。
-        all_region_sums = np.array(all_region_sums, dtype=np.float64)
-        mean_sum = float(np.mean(all_region_sums))
-        std_sum  = float(np.std(all_region_sums))
-        self.ndwi_threshold = mean_sum + self.ndwi_threshold_k * std_sum
-        # 保存全图最大 NDWI 区域和，用于多段搜索时计算新段启动阈值 T_water
-        self.max_ndwi_sum = max_sum_first
-
-        # 打印增强诊断报告（含量纲识别、阈值分析、调参建议）
-        self._print_threshold_diagnosis(mean_sum, std_sum, all_region_sums)
-
-        # 随机选择一个位置作为起点
-        max_i_first, max_j_first = max_positions[np.random.choice(len(max_positions))]
-        # 记录初始区域坐标并绘制绿色虚线边框
-        self.path_coords.append((max_i_first, max_j_first))
-        x, y = max_j_first, max_i_first  # 列j对应x，行i对应y
-        w, h = self.region_size, self.region_size
-        cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (0, 255, 0), 2, lineType=cv2.LINE_4)  # 绿色虚线
-        # 添加序号（第一个区域序号为1）
-        cv2.putText(self.schematic_img, "1", (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)  # 白色字体，大小1，厚度2
-
-        # 标记已访问的区域
-        visited_regions[max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size] = 1
-        print(f"[阶段1完成] 找到初始区域: ({max_i_first}, {max_j_first})")
-
-        return max_i_first, max_j_first, visited_regions
-        
-    def find_second_region(self, image_array, max_i_first, max_j_first, visited_regions):
-        """
-        在第一个区域的周围找到第二个最大NDWI区域。
-
-        【新增】相对阈值终止判断：
-            贪心搜索选出的最优候选窗口（8邻域中NDWI最高者）若其NDWI区域和
-            低于 self.ndwi_threshold，则视为"已无高NDWI邻域可扩展"，
-            返回 max_i_second=-9（与全部邻域不可达时行为一致），
-            触发主搜索提前终止，将剩余区域交由补充扫描段处理。
-
-        返回：
-            max_i_second: 第二个最大NDWI值的位置的行索引
-            max_j_second: 第二个最大NDWI值的位置的列索引
-            visited_regions: 用于记录已经访问过的区域的矩阵
-        """
-        print(f"[阶段2] 开始寻找相邻区域，基于初始区域: ({max_i_first}, {max_j_first})")
-        ndwi_band = image_array[-1,:,:]
-        height, width = image_array.shape[-2:]
-        max_sum_second = -19e9
-        max_i_second = max_j_second = -9
-        directions = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
-        best_dx = best_dy = 0
-        for direction in directions:
-            dx, dy = direction
-            i = max_i_first + dx * (self.region_size - self.shift_size)
-            j = max_j_first + dy * (self.region_size - self.shift_size)
-            if i < 0 or i + self.region_size > height or j < 0 or j + self.region_size > width:
-                continue
-            if visited_regions[i:i+self.region_size, j:j+self.region_size].sum() == self.region_size * self.region_size:
-                continue
-            region_sum = self.get_region_sum(i, j)
-
-            if region_sum > max_sum_second:
-                max_sum_second = region_sum
-                best_dx = dx
-                best_dy = dy
-                max_i_second = i
-                max_j_second = j
-
-        # ── 相对阈值终止判断（方案二核心逻辑） ────────────────────────────────
-        # 仅当阈值已被计算（find_first_region 已执行）且最优候选窗口低于阈值时触发。
-        # 此时即使物理邻域尚未全部访问，也认为已无值得继续扩展的高NDWI区域，
-        # 主搜索应当终止，后续区域交由补充扫描段（pre_seg）以 D=(0,0) 处理。
-        if (max_i_second != -9
-                and self.ndwi_threshold is not None
-                and max_sum_second < self.ndwi_threshold):
-            print(f"[阶段2] 最优候选窗口 NDWI 和 ({max_sum_second:.2f}) "
-                  f"低于阈值 ({self.ndwi_threshold:.2f})，主搜索提前终止。")
-            max_i_second = max_j_second = -9
-            best_dx = best_dy = 0
-        # ────────────────────────────────────────────────────────────────────────
-
-        # 在信息最充分时（SAS 阶段），将方向转换为几何边缘标识符，
-        # 避免下游模块在方向改变时用 last_dx/last_dy 间接推算而出错。
-        ftc_side, recv_side = self._direction_to_sides(best_dx, best_dy)
-
-        if max_i_second != -9:  # 找到有效且高于阈值的区域时
-            # 记录当前区域坐标并绘制绿色虚线边框
-            self.path_coords.append((max_i_second, max_j_second))
-            x, y = max_j_second, max_i_second
-            w, h = self.region_size, self.region_size
-            cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (0, 255, 0), 2, lineType=cv2.LINE_4)  # 绿色虚线
-            # 添加序号（当前路径长度即为序号）
-            current_index = len(self.path_coords)
-            cv2.putText(self.schematic_img, str(current_index), (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)  # 白色字体
-            # 绘制红色实线连接前一个区域
-            if len(self.path_coords) >= 2:
-                prev_i, prev_j = self.path_coords[-2]
-                prev_center = (prev_j + w//2, prev_i + h//2)  # 前一个区域中心(x,y)
-                current_center = (x + w//2, y + h//2)  # 当前区域中心
-                cv2.line(self.schematic_img, prev_center, current_center, (0, 0, 255), 2)  # 红色实线
-
-        visited_regions[max_i_second:max_i_second+self.region_size, max_j_second:max_j_second+self.region_size] = 1
-        if max_i_second != -9:
-            print(f"[阶段2完成] 找到相邻区域: ({max_i_second}, {max_j_second})，"
-                  f"ftc_side={ftc_side}，recv_side={recv_side}")
-        else:
-            print("[阶段2完成] 未找到有效相邻区域")
-
-        return max_i_first, max_j_first, max_i_second, max_j_second, visited_regions, ftc_side, recv_side
-    
-    def save_gdal_image(self, image_array, index):
-        driver = gdal.GetDriverByName('PNG')
-        driver.CreateCopy(self.image_dir + self.image_name + f"_{index}.png", image_array)
-    
-    def pre_seg(self, visited_regions, image, annotation, index):
-        """
-        主要用于在递归分割结束后，对未被访问的区域进行分割和保存。
-        """
-        num_rows = (self.height - self.region_size) // (self.region_size - self.shift_size) + 1
-        num_cols = (self.width - self.region_size) // (self.region_size - self.shift_size) + 1
-        
-        # 计算剩余区域总数并初始化进度条
-        total_regions = num_rows * num_cols
-        processed_regions = 0
-        pbar = tqdm(total=total_regions, desc='剩余区域处理进度', unit='区域')
-        
-        for row in range(num_rows):
-            for col in range(num_cols):
-                start_x = col * (self.region_size - self.shift_size)
-                start_y = row * (self.region_size - self.shift_size)
-                if visited_regions[start_y:start_y+self.region_size, start_x:start_x+self.region_size].sum() != self.region_size * self.region_size:
-                    image_patch = image[:, start_y:start_y+self.region_size, start_x:start_x+self.region_size]
-                    annotation_patch = annotation[:, start_y:start_y+self.region_size, start_x:start_x+self.region_size]
-                    index += 1
-                    # 补充扫描段：无移动关系，ftc_side=-1, recv_side=-1
-                    self.save_patch(image_patch, self.image_dir, index, ftc_side=-1, recv_side=-1)
-                    self.save_patch(annotation_patch, self.annotation_dir, index, ftc_side=-1, recv_side=-1)
-                
-                # 更新进度条
-                processed_regions += 1
-                pbar.update(1)
-                pbar.set_postfix({'当前区域': f'({row},{col})', '总进度': f'{processed_regions}/{total_regions}'})
-                
-        # 关闭进度条
-        pbar.close()
-
-    @staticmethod
-    def _direction_to_sides(dx, dy):
-        """
-        将移动方向 (dx, dy) 转换为 (ftc_side, recv_side)。
-
-        ftc_side：当前 patch 应在 FTC 阶段裁剪的边（前沿，即朝向下一个 patch 的那条边）
-        recv_side：下一个 patch 应在 FTP 阶段接收注入的边（后沿，即与当前 patch 接触的那条边）
-        两者互为对边，由 SAS 在信息最充分时直接计算，避免下游用 dx/dy 间接推算。
-
-        编码：0=底 1=顶 2=右 3=左 4=右下角 5=左下角 6=右上角 7=左上角 -1=无移动
-        对边映射：{0↔1, 2↔3, 4↔7, 5↔6}
-        """
-        _opposite = {0: 1, 1: 0, 2: 3, 3: 2, 4: 7, 7: 4, 5: 6, 6: 5, -1: -1}
-        _dir_to_ftc = {
-            (1,  0): 0,   # 向下前进 → 前沿在底部
-            (-1, 0): 1,   # 向上前进 → 前沿在顶部
-            (0,  1): 2,   # 向右前进 → 前沿在右侧
-            (0, -1): 3,   # 向左前进 → 前沿在左侧
-            (1,  1): 4,   # 向右下   → 前沿在右下角
-            (1, -1): 5,   # 向左下   → 前沿在左下角
-            (-1, 1): 6,   # 向右上   → 前沿在右上角
-            (-1,-1): 7,   # 向左上   → 前沿在左上角
-            (0,  0): -1,  # 无移动
-        }
-        ftc_side = _dir_to_ftc.get((dx, dy), -1)
-        recv_side = _opposite[ftc_side]
-        return ftc_side, recv_side
-
-    def save_patch(self, patch, path, index, ftc_side=-1, recv_side=-1):
-        """
-        将图像块保存到指定目录。
-
-        文件名格式：<name>/<name>_<id>_<ftc_side>_<recv_side>.png
-          ftc_side：本 patch 的 FTC 裁剪边（-1 表示无移动）
-          recv_side：本 patch 的 FTP 接收边（-1 表示无移动）
-        """
-        filename = self.image_name + "/" + self.image_name + f"_{index}" + f"_{ftc_side}_{recv_side}.png"
-        save_path = os.path.join(path, filename)
-        if path == self.image_dir:
-            self.image_list = dict(filename=filename)
-            self.image_list['annotation'] = dict(seg_map=filename)
-            self.image_info_list.append(self.image_list)
-        if os.path.exists(save_path):
-            return
-        patch = patch.transpose(1, 2, 0)  # (C,H,W) → (H,W,C)，此时通道顺序仍为 GDAL 原始顺序（RGB）
-        patch = patch[:, :, ::-1].copy()   # RGB → BGR，与 cv2.imwrite 的写入约定对齐
-        if not os.path.exists(os.path.dirname(save_path)):
-            os.makedirs(os.path.dirname(save_path))
-        cv2.imwrite(save_path, patch)
-       
-    def recursive_segmentation(self, max_i_first, max_j_first, visited_regions, image, annotation, index, prev_max_i_second=None, prev_max_j_second=None, prev_recv_side=-1, skip_pre_seg=False, is_segment_start=False):
-        """
-        递归的调用find_second_region函数，
-        通过find_second_region函数找到下一个最大值的坐标，
-        并保存图像块。
-
-        prev_recv_side：上一次 find_second_region 返回的 recv_side，
-                        即本次要保存的 patch 的 FTP 接收边编码。
-        skip_pre_seg：若为 True，段终止时不调用 pre_seg，而是将终止 index
-                      存入 self._segment_end_index 后返回（用于多段搜索）。
-        is_segment_start：若为 True，视为新段起点，保存起点 patch（recv_side=-1）。
-        """
-        if index >= self.max_iterations:
-            self._segment_end_index = index
-            if skip_pre_seg:
-                print("[递归阶段] 达到最大迭代次数，当前段终止")
-                return
-            print("[递归阶段] 达到最大迭代次数，开始处理剩余区域")
-            self.pre_seg(visited_regions, image, annotation, index)
-            return
-
-        # 初始化进度条
-        if index == 1 or is_segment_start:
-            self.pbar = tqdm(total=self.max_iterations, desc='分割进度', unit='iter')
-
-        # 更新进度条
-        self.pbar.update(1)
-        self.pbar.set_postfix({'当前迭代': index})
-
-        max_i_first, max_j_first, max_i_second, max_j_second, visited_regions, ftc_side, recv_side = self.find_second_region(self.image, max_i_first, max_j_first, visited_regions)
-
-        if max_i_second == -9:
-            # 无有效邻域：将上一帧位置以 ftc_side=-1/recv_side=prev_recv_side 保存后终止
-            if prev_max_i_second is not None:
-                second_region_rgb = image[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-                second_region_annotation = annotation[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-                self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=-1, recv_side=prev_recv_side)
-                self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=-1, recv_side=prev_recv_side)
-            self._segment_end_index = index
-            if skip_pre_seg:
-                print("[递归阶段] 未找到有效相邻区域，当前段终止")
-                return
-            print("[递归阶段] 未找到有效相邻区域，开始处理剩余区域")
-            self.pre_seg(visited_regions, image, annotation, index)
-            return
-
-        if prev_max_i_second is not None:
-            # 保存上一帧 patch：
-            #   ftc_side = 本次搜索得到的 ftc_side（上一帧应裁剪的前沿边）
-            #   recv_side = 上一次传入的 prev_recv_side（上一帧应接收注入的后沿边）
-            second_region_rgb = image[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-            second_region_annotation = annotation[:, prev_max_i_second:prev_max_i_second+self.region_size, prev_max_j_second:prev_max_j_second+self.region_size]
-            self.save_patch(second_region_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=prev_recv_side)
-            self.save_patch(second_region_annotation, self.annotation_dir, index, ftc_side=ftc_side, recv_side=prev_recv_side)
-
-        if index == 1 or is_segment_start:
-            # 段起始 patch：无前驱，recv_side=-1；ftc_side 由本次搜索决定
-            first_region_rgb = image[:, max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size]
-            first_region_annotation = annotation[:, max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size]
-            self.save_patch(first_region_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=-1)
-            self.save_patch(first_region_annotation, self.annotation_dir, index, ftc_side=ftc_side, recv_side=-1)
-
-        self.recursive_segmentation(max_i_second, max_j_second, visited_regions, image, annotation, index+1, max_i_second, max_j_second, prev_recv_side=recv_side, skip_pre_seg=skip_pre_seg)
-
-    def _find_new_isp(self, visited_regions, t_water):
-        """
-        重扫全图，在未访问区域中找到 NDWI 区域和最高且超过 T_water 的窗口，
-        作为新段主搜索起点（ISP, Initial Starting Point）。
-
-        复用已有积分图，额外计算量为 O(1) 查询 × 窗口总数。
-
-        参数：
-            visited_regions: 已访问区域矩阵
-            t_water: 新段启动阈值，用于拦截道路伪高 NDWI 窗口
-
-        返回：
-            (best_i, best_j): 新 ISP 坐标；若无合适窗口则返回 (-9, -9)
-        """
-        best_sum = -1e9
-        best_i, best_j = -9, -9
-
-        for i in range(0, self.height - self.region_size + 1, self.region_size - self.shift_size):
-            for j in range(0, self.width - self.region_size + 1, self.region_size - self.shift_size):
-                # 跳过已完全访问的窗口
-                if visited_regions[i:i+self.region_size, j:j+self.region_size].sum() == self.region_size * self.region_size:
-                    continue
-                region_sum = self.get_region_sum(i, j)
-                if region_sum > t_water and region_sum > best_sum:
-                    best_sum = region_sum
-                    best_i, best_j = i, j
-
-        return best_i, best_j
-
-    def sgsw_single_segment(self):
-        """
-        原始单段主搜索方法（动态阈值法）。
-
-        流程：find_first_region → recursive_segmentation → pre_seg
-        特点：单段贪心搜索，第一段终止后直接进入补充扫描。
-        适用：水体集中于单一连通区域的场景。
-        """
-        image_rgb = self.image[:3,:,:]
-        annotation = gdal.Open(self.annotation_path)
-        annotation = annotation.ReadAsArray()
-        annotation = np.expand_dims(annotation, axis=0)
-        max_i_first, max_j_first, visited_regions = self.find_first_region(self.image)
-        self.recursive_segmentation(max_i_first, max_j_first, visited_regions, image_rgb, annotation, 1)
-
-        # 关闭进度条
-        if hasattr(self, 'pbar'):
-            self.pbar.close()
-
-    def sgsw_multi_segment(self, max_segments=None, alpha=0.4):
-        """
-        多段主搜索方法（连通域感知）。
-
-        流程：find_first_region → [recursive_segmentation → 重扫找新ISP] × N → pre_seg
-
-        核心改进：
-        - 每段终止后不立即进入补充扫描，而是重扫全图寻找未覆盖的高 NDWI 区域
-        - 双阈值设计：T_expand（段内扩展，现有 ndwi_threshold）+ T_water（新段启动）
-        - T_water 基于 ndwi_zero_sum 锚定，有效过滤道路伪高 NDWI 窗口
-        - 段间跳跃天然使用 ftc_side=-1, recv_side=-1，TBTI 自动禁用
-
-        参数：
-            max_segments (int or None): 最大搜索段数。
-                None = 自适应，直到全图所有高 NDWI 区域覆盖；
-                N = 固定 N 段后进入补充扫描。
-            alpha (float): T_water 计算系数，默认 0.4。
-                T_water = ndwi_zero_sum + α × (max_ndwi_sum - ndwi_zero_sum)
-                α 越大，新段启动要求越高，对道路过滤越严格。
-                建议范围 [0.3, 0.5]。
-        """
-        image_rgb = self.image[:3,:,:]
-        annotation = gdal.Open(self.annotation_path)
-        annotation = annotation.ReadAsArray()
-        annotation = np.expand_dims(annotation, axis=0)
-
-        # 第一段 ISP
-        max_i, max_j, visited_regions = self.find_first_region(self.image)
-
-        # ── 计算新段启动阈值 T_water ──────────────────────────────────────────
-        t_water = self.ndwi_zero_sum + alpha * (self.max_ndwi_sum - self.ndwi_zero_sum)
-        window_pixels = self.region_size * self.region_size
-        t_water_pixel = t_water / window_pixels
-        sep = '─' * 60
-        print(f'\n{sep}')
-        print(f'[SGSW 多段搜索] 双阈值配置：')
-        print(f'  T_expand（段内扩展阈值）= {self.ndwi_threshold:.2f}'
-              f'  （对应像素均值 {self.ndwi_threshold / window_pixels:.2f}）')
-        print(f'  T_water （新段启动阈值）= {t_water:.2f}'
-              f'  （对应像素均值 {t_water_pixel:.2f}, α={alpha}）')
-        print(f'  max_segments = {max_segments if max_segments is not None else "自适应"}')
-        print(f'{sep}\n')
-
-        segment_count = 0
-        index = 1
-
-        while True:
-            segment_count += 1
-            print(f'\n[多段搜索] ═══ 启动第 {segment_count} 段主搜索 ═══'
-                  f'  ISP=({max_i}, {max_j})')
-
-            # 运行当前段的递归分割（不调用 pre_seg）
-            self._segment_end_index = index
-            is_first_segment = (segment_count == 1)
-            self.recursive_segmentation(
-                max_i, max_j, visited_regions, image_rgb, annotation, index,
-                skip_pre_seg=True,
-                is_segment_start=(not is_first_segment)
-            )
-
-            # 关闭当前段的进度条
-            if hasattr(self, 'pbar'):
-                self.pbar.close()
-
-            index = self._segment_end_index
-
-            # 检查是否达到段数上限
-            if max_segments is not None and segment_count >= max_segments:
-                print(f'[多段搜索] 达到最大段数 {max_segments}，进入补充扫描')
-                break
-
-            # 重扫全图寻找新 ISP
-            new_i, new_j = self._find_new_isp(visited_regions, t_water)
-            if new_i == -9:
-                print('[多段搜索] 全图所有高 NDWI 区域已覆盖，进入补充扫描')
-                break
-
-            new_sum = self.get_region_sum(new_i, new_j)
-            new_pixel = new_sum / window_pixels
-            print(f'[多段搜索] 发现新 ISP: ({new_i}, {new_j})，'
-                  f'NDWI 区域和={new_sum:.2f}（像素均值={new_pixel:.2f}）')
-
-            # 标记新 ISP 为已访问
-            visited_regions[new_i:new_i+self.region_size,
-                            new_j:new_j+self.region_size] = 1
-            # 在示意图上标记新段起点（橙色边框 + 段号标签）
-            self.path_coords.append((new_i, new_j))
-            x, y = new_j, new_i
-            w, h = self.region_size, self.region_size
-            cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h),
-                          (0, 165, 255), 3)  # 橙色 (BGR)
-            cv2.putText(self.schematic_img, f'S{segment_count+1}',
-                        (x + 10, y + 60), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2, (0, 165, 255), 2)
-
-            max_i, max_j = new_i, new_j
-            index += 1  # 新段从下一个 index 开始
-
-        # 全部主搜索段完成后，进入补充扫描
-        self.pre_seg(visited_regions, image_rgb, annotation, index)
-
-    def main(self, method='multi_segment', max_segments=2, alpha=0.4):
-        """
-        SGSW 主入口。
-
-        参数：
-            method (str): 搜索方法选择。
-                'single_segment' — 原始单段主搜索（动态阈值法）
-                'multi_segment'  — 多段主搜索（连通域感知，默认）
-            max_segments (int or None): 多段搜索时的最大段数（仅 multi_segment 有效）。
-                None = 自适应；N = 固定 N 段。默认 2。
-            alpha (float): 多段搜索的 T_water 系数（仅 multi_segment 有效）。
-                默认 0.4。
-        """
-        if method == 'single_segment':
-            self.sgsw_single_segment()
-        elif method == 'multi_segment':
-            self.sgsw_multi_segment(max_segments=max_segments, alpha=alpha)
-        else:
-            raise ValueError(f"未知的 SGSW 方法: {method}，"
-                             f"可选: 'single_segment', 'multi_segment'")
-
-        # 保存示意图
-        os.makedirs(self.schematic_dir, exist_ok=True)
-        existing_files = [f for f in os.listdir(self.schematic_dir) if f.startswith(f"{self.image_name}_schematic_")]
-        schematic_num = len(existing_files) + 1
-        schematic_path = os.path.join(self.schematic_dir, f"{self.image_name}_schematic_{schematic_num}.png")
-        cv2.imwrite(schematic_path, self.schematic_img)
-
-        return self.image_info_list
-    
     def calculate_integral_image(self, ndvi):
-        """计算积分图像"""
         h, w = ndvi.shape
         integral = np.zeros((h+1, w+1), dtype=np.float32)
         integral[1:, 1:] = ndvi.cumsum(0).cumsum(1)
         return integral
 
     def get_region_sum(self, i, j):
-        """通过积分图像计算区域和"""
         i_end = i + self.region_size
         j_end = j + self.region_size
-        return (self.integral_image[i_end, j_end] 
-                - self.integral_image[i, j_end] 
-                - self.integral_image[i_end, j] 
+        return (self.integral_image[i_end, j_end]
+                - self.integral_image[i, j_end]
+                - self.integral_image[i_end, j]
                 + self.integral_image[i, j])
-# if __name__ == "__main__":
-#     image_path = r"C:\Users\Hi\Downloads\H48F015017_clip1.png"
-#     annotation_path = r"C:\Users\Hi\Downloads\H48F015017_clip1_.png"
-#     image_info_list = []
-    
-#     pre_segmentation = SGSW(image_path, annotation_path, image_info_list)
-#     result = pre_segmentation.main()
-#     print(result)
+
+    def find_first_region(self, image_array):
+        print("[DFS阶段1] 开始寻找初始区域并计算全局NDWI阈值...")
+        ndwi_band = image_array[-1, :, :]
+        visited_regions = np.zeros_like(ndwi_band)
+
+        all_region_sums = []
+        candidates = []
+
+        for i in range(0, self.height - self.region_size + 1, self.region_size - self.shift_size):
+            for j in range(0, self.width - self.region_size + 1, self.region_size - self.shift_size):
+                region_sum = self.get_region_sum(i, j)
+                all_region_sums.append(region_sum)
+                candidates.append((i, j, region_sum))
+
+        all_region_sums = np.array(all_region_sums, dtype=np.float64)
+        mean_sum = float(np.mean(all_region_sums))
+        std_sum = float(np.std(all_region_sums))
+        self.ndwi_threshold = mean_sum + self.ndwi_threshold_k * std_sum
+        self.tolerance_threshold = self.ndwi_threshold * self.tolerance_ratio
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        self.max_ndwi_sum = candidates[0][2] if candidates else 0
+
+        print(f"[DFS阶段1] NDWI阈值: {self.ndwi_threshold:.2f}, 容忍阈值: {self.tolerance_threshold:.2f}")
+
+        validated_isp = None
+        for candidate_i, candidate_j, candidate_sum in candidates[:self.top_k_candidates]:
+            is_valid, water_ratio = self._validate_seed_with_label(
+                candidate_i, candidate_j,
+                water_ratio_threshold=self.seed_water_ratio_threshold
+            )
+            if is_valid:
+                validated_isp = (candidate_i, candidate_j)
+                print(f"[DFS阶段1] 标注验证通过: ({candidate_i}, {candidate_j}), 水体占比={water_ratio:.2%}")
+                break
+
+        if validated_isp is None:
+            print(f"[DFS阶段1] ⚠ 警告:所有Top-K候选均未通过标注验证,放弃主搜索,全部交给补充扫描")
+            return None, None, visited_regions
+
+        max_i_first, max_j_first = validated_isp
+        self.path_coords.append((max_i_first, max_j_first))
+        x, y = max_j_first, max_i_first
+        w, h = self.region_size, self.region_size
+        cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(self.schematic_img, "1", (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        visited_regions[max_i_first:max_i_first+self.region_size, max_j_first:max_j_first+self.region_size] = 1
+        print(f"[DFS阶段1完成] 找到初始区域: ({max_i_first}, {max_j_first})")
+
+        return max_i_first, max_j_first, visited_regions
+
+    def _get_valid_neighbors(self, current_i, current_j, visited_regions):
+        directions = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+        neighbors = []
+
+        for dx, dy in directions:
+            i = current_i + dx * (self.region_size - self.shift_size)
+            j = current_j + dy * (self.region_size - self.shift_size)
+
+            if i < 0 or i + self.region_size > self.height or j < 0 or j + self.region_size > self.width:
+                continue
+            if visited_regions[i:i+self.region_size, j:j+self.region_size].sum() == self.region_size * self.region_size:
+                continue
+
+            region_sum = self.get_region_sum(i, j)
+            neighbors.append(WindowNode(i, j, region_sum, (dx, dy)))
+
+        neighbors.sort(key=lambda x: x.ndwi_sum, reverse=True)
+        return neighbors
+
+    def _validate_with_tolerance(self, neighbor, tolerance_counter):
+        ndwi_sum = neighbor.ndwi_sum
+
+        if ndwi_sum >= self.ndwi_threshold:
+            is_valid, water_ratio = self._validate_seed_with_label(
+                neighbor.i, neighbor.j,
+                water_ratio_threshold=self.path_water_ratio_threshold
+            )
+            if is_valid:
+                return True, 0, 'strong'
+
+        if tolerance_counter < self.max_tolerance_steps:
+            if ndwi_sum >= self.tolerance_threshold:
+                return True, tolerance_counter + 1, 'tolerance'
+
+        return False, tolerance_counter, 'rejected'
+
+    @staticmethod
+    def _direction_to_sides(dx, dy):
+        _opposite = {0: 1, 1: 0, 2: 3, 3: 2, 4: 7, 7: 4, 5: 6, 6: 5, -1: -1}
+        _dir_to_ftc = {
+            (1, 0): 0, (-1, 0): 1, (0, 1): 2, (0, -1): 3,
+            (1, 1): 4, (1, -1): 5, (-1, 1): 6, (-1, -1): 7,
+            (0, 0): -1,
+        }
+        ftc_side = _dir_to_ftc.get((dx, dy), -1)
+        recv_side = _opposite[ftc_side]
+        return ftc_side, recv_side
+
+    def _dfs_explore(self, current_i, current_j, visited_regions, path_stack,
+                     image, annotation, index, prev_recv_side=-1, is_segment_start=False):
+        tolerance_counter = 0
+        tolerance_path = []
+
+        if not hasattr(self, '_failed_tolerance_paths'):
+            self._failed_tolerance_paths = set()
+
+        while index <= self.max_iterations:
+            neighbors = self._get_valid_neighbors(current_i, current_j, visited_regions)
+
+            next_window = None
+            unexplored_high_quality = []
+            validation_type = None
+
+            for neighbor in neighbors:
+                is_valid, new_tolerance_counter, v_type = self._validate_with_tolerance(
+                    neighbor, tolerance_counter
+                )
+
+                if is_valid:
+                    if next_window is None:
+                        next_window = neighbor
+                        tolerance_counter = new_tolerance_counter
+                        validation_type = v_type
+                    elif v_type == 'strong':
+                        unexplored_high_quality.append(neighbor)
+
+            if next_window is None:
+                if len(tolerance_path) > 0:
+                    print(f"[DFS容忍] 容忍路径失败（末尾），将{len(tolerance_path)+1}个窗口保存为补充段")
+                    for item in tolerance_path:
+                        patch_rgb = image[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                        if (item['i'], item['j']) not in self.saved_coords:
+                            patch_rgb = image[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                            patch_ann = annotation[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                            self.save_patch(patch_rgb, self.image_dir, index, ftc_side=-1, recv_side=-1)
+                            self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=-1, recv_side=-1)
+                            self.saved_coords.add((item['i'], item['j']))
+                            index += 1
+                        self._failed_tolerance_paths.add((item['next_i'], item['next_j']))
+                    
+                    if (current_i, current_j) not in self.saved_coords:
+                        patch_rgb = image[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+                        patch_ann = annotation[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+                        self.save_patch(patch_rgb, self.image_dir, index, ftc_side=-1, recv_side=-1)
+                        self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=-1, recv_side=-1)
+                        self.saved_coords.add((current_i, current_j))
+                        index += 1
+                    tolerance_path = []
+                else:
+                    if (current_i, current_j) not in self.saved_coords:
+                        patch_rgb = image[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+                        patch_ann = annotation[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+                        r_side = -1 if is_segment_start else prev_recv_side
+                        self.save_patch(patch_rgb, self.image_dir, index, ftc_side=-1, recv_side=r_side)
+                        self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=-1, recv_side=r_side)
+                        self.saved_coords.add((current_i, current_j))
+                        index += 1
+                    if is_segment_start:
+                        print(f"[DFS] 孤立水坑: ({current_i}, {current_j}) 已保存")
+
+                return index, visited_regions
+
+            if len(unexplored_high_quality) > 0:
+                path_stack.append(ForkPoint(current_i, current_j, unexplored_high_quality))
+
+            dx, dy = next_window.direction
+            ftc_side, recv_side = self._direction_to_sides(dx, dy)
+
+            if validation_type == 'tolerance':
+                tolerance_path.append({
+                    'i': current_i,
+                    'j': current_j,
+                    'ftc_side': ftc_side,
+                    'recv_side': -1 if is_segment_start else prev_recv_side,
+                    'next_i': next_window.i,
+                    'next_j': next_window.j
+                })
+            elif validation_type == 'strong':
+                if len(tolerance_path) > 0:
+                    print(f"[DFS容忍] 容忍路径成功，保存{len(tolerance_path)}个容忍窗口")
+                    for item in tolerance_path:
+                        if (item['i'], item['j']) not in self.saved_coords:
+                            patch_rgb = image[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                            patch_ann = annotation[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                            self.save_patch(patch_rgb, self.image_dir, index, ftc_side=item['ftc_side'], recv_side=item['recv_side'])
+                            self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=item['ftc_side'], recv_side=item['recv_side'])
+                            self.saved_coords.add((item['i'], item['j']))
+                            index += 1
+
+                        # 延迟绘制验证成功的容忍窗口
+                        tol_i, tol_j = item['next_i'], item['next_j']
+                        self.path_coords.append((tol_i, tol_j))
+                        x, y = tol_j, tol_i
+                        w, h = self.region_size, self.region_size
+                        cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (255, 255, 0), 2)
+                        cv2.putText(self.schematic_img, str(len(self.path_coords)),
+                                   (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        
+                        prev_center = (item['j'] + w//2, item['i'] + h//2)
+                        current_center = (x + w//2, y + h//2)
+                        cv2.line(self.schematic_img, prev_center, current_center, (0, 0, 255), 2)
+
+                    tolerance_path = []
+                    tolerance_counter = 0
+
+                if (current_i, current_j) not in self.saved_coords:
+                    patch_rgb = image[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+                    patch_ann = annotation[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+                    r_side = -1 if is_segment_start else prev_recv_side
+                    self.save_patch(patch_rgb, self.image_dir, index, ftc_side=ftc_side, recv_side=r_side)
+                    self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=ftc_side, recv_side=r_side)
+                    self.saved_coords.add((current_i, current_j))
+                    index += 1
+
+            visited_regions[next_window.i:next_window.i+self.region_size, next_window.j:next_window.j+self.region_size] = 1
+
+            if validation_type == 'strong':
+                self.path_coords.append((next_window.i, next_window.j))
+                x, y = next_window.j, next_window.i
+                w, h = self.region_size, self.region_size
+                cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(self.schematic_img, str(len(self.path_coords)),
+                           (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+                # 使用物理父子节点进行连线
+                prev_center = (current_j + w//2, current_i + h//2)
+                current_center = (x + w//2, y + h//2)
+                cv2.line(self.schematic_img, prev_center, current_center, (0, 0, 255), 2)
+
+            current_i, current_j = next_window.i, next_window.j
+            prev_recv_side = recv_side
+            is_segment_start = False
+
+        if len(tolerance_path) > 0:
+            for item in tolerance_path:
+                if (item['i'], item['j']) not in self.saved_coords:
+                    patch_rgb = image[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                    patch_ann = annotation[:, item['i']:item['i']+self.region_size, item['j']:item['j']+self.region_size]
+                    self.save_patch(patch_rgb, self.image_dir, index, ftc_side=-1, recv_side=-1)
+                    self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=-1, recv_side=-1)
+                    self.saved_coords.add((item['i'], item['j']))
+                    index += 1
+                self._failed_tolerance_paths.add((item['next_i'], item['next_j']))
+            tolerance_path = []
+
+        if (current_i, current_j) not in self.saved_coords:
+            patch_rgb = image[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+            patch_ann = annotation[:, current_i:current_i+self.region_size, current_j:current_j+self.region_size]
+            r_side = -1 if is_segment_start else prev_recv_side
+            self.save_patch(patch_rgb, self.image_dir, index, ftc_side=-1, recv_side=r_side)
+            self.save_patch(patch_ann, self.annotation_dir, index, ftc_side=-1, recv_side=r_side)
+            self.saved_coords.add((current_i, current_j))
+            index += 1
+
+        return index, visited_regions
+
+    def _backtrack(self, path_stack, visited_regions, image, annotation, index):
+        while len(path_stack) > 0:
+            fork_point = path_stack.pop()
+
+            # 过滤掉已访问或在失败黑名单中的窗口
+            still_valid = [
+                n for n in fork_point.unexplored
+                if (visited_regions[n.i:n.i+self.region_size, n.j:n.j+self.region_size].sum()
+                    < self.region_size * self.region_size
+                    and (n.i, n.j) not in getattr(self, '_failed_tolerance_paths', set()))
+            ]
+
+            if len(still_valid) > 0:
+                print(f"[DFS回溯] 从分叉点({fork_point.i}, {fork_point.j})继续探索")
+
+                # 不重新添加到path_coords，因为分叉点已经在第一次探索时添加过了
+                # 只在示意图上标记分叉点
+                x, y = fork_point.j, fork_point.i
+                w, h = self.region_size, self.region_size
+                cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (0, 165, 255), 3)
+
+                return fork_point.i, fork_point.j, still_valid, index
+
+        return None, None, [], index
+
+    def dfs_single_segment(self):
+        image_rgb = self.image[:3, :, :]
+        annotation = gdal.Open(self.annotation_path)
+        annotation = annotation.ReadAsArray()
+        annotation = np.expand_dims(annotation, axis=0)
+
+        max_i, max_j, visited_regions = self.find_first_region(self.image)
+
+        # 如果没有找到有效起点，直接进入补充扫描
+        if max_i is None:
+            print("[DFS] 未找到有效起点，跳过主搜索，直接进入补充扫描")
+            self.pre_seg(visited_regions, image_rgb, annotation, 1)
+            return
+
+        path_stack = []
+        index = 1  # 从1开始，匹配greenland.py的file_idx逻辑
+
+        print("[DFS] 开始深度优先搜索...")
+        index, visited_regions = self._dfs_explore(
+            max_i, max_j, visited_regions, path_stack,
+            image_rgb, annotation, index, prev_recv_side=-1, is_segment_start=True
+        )
+
+        while True:
+            fork_i, fork_j, unexplored, index = self._backtrack(
+                path_stack, visited_regions, image_rgb, annotation, index
+            )
+
+            if fork_i is None:
+                print("[DFS] 所有分支探索完成")
+                break
+
+            index, visited_regions = self._dfs_explore(
+                fork_i, fork_j, visited_regions, path_stack,
+                image_rgb, annotation, index, prev_recv_side=-1
+            )
+
+        self.pre_seg(visited_regions, image_rgb, annotation, index)
+
+    def _find_new_isp(self, visited_regions, t_water):
+        candidates = []
+        for i in range(0, self.height - self.region_size + 1, self.region_size - self.shift_size):
+            for j in range(0, self.width - self.region_size + 1, self.region_size - self.shift_size):
+                if visited_regions[i:i+self.region_size, j:j+self.region_size].sum() == self.region_size * self.region_size:
+                    continue
+                region_sum = self.get_region_sum(i, j)
+                if region_sum > t_water:
+                    candidates.append((i, j, region_sum))
+
+        if not candidates:
+            return -9, -9
+
+        candidates.sort(key=lambda x: x[2], reverse=True)
+
+        validated_isp = None
+        for candidate_i, candidate_j, candidate_sum in candidates[:self.top_k_candidates]:
+            is_valid, water_ratio = self._validate_seed_with_label(
+                candidate_i, candidate_j,
+                water_ratio_threshold=self.new_isp_water_ratio_threshold
+            )
+            if is_valid:
+                validated_isp = (candidate_i, candidate_j)
+                print(f"[DFS多段] 新ISP验证通过: ({candidate_i}, {candidate_j}), 水体占比={water_ratio:.2%}")
+                break
+
+        if validated_isp is None:
+            print(f"[DFS多段] ⚠ 所有候选均未通过验证，终止多段搜索")
+            return -9, -9
+
+        return validated_isp
+
+    def dfs_multi_segment(self, max_segments=None, alpha=0):
+        image_rgb = self.image[:3, :, :]
+        annotation = gdal.Open(self.annotation_path)
+        annotation = annotation.ReadAsArray()
+        annotation = np.expand_dims(annotation, axis=0)
+
+        max_i, max_j, visited_regions = self.find_first_region(self.image)
+
+        # 如果没有找到有效起点，直接进入补充扫描
+        if max_i is None:
+            print("[DFS多段] 未找到有效起点，跳过主搜索，直接进入补充扫描")
+            self.pre_seg(visited_regions, image_rgb, annotation, 1)
+            return
+
+        t_water = self.ndwi_zero_sum + alpha * (self.max_ndwi_sum - self.ndwi_zero_sum)
+        window_pixels = self.region_size * self.region_size
+        t_water_pixel = t_water / window_pixels
+        print(f"[DFS多段] T_expand={self.ndwi_threshold:.2f}, T_water={t_water:.2f}")
+
+        segment_count = 0
+        index = 1  # 从1开始，匹配greenland.py的file_idx逻辑
+
+        while True:
+            segment_count += 1
+            print(f"\n[DFS多段] ═══ 第{segment_count}段 ═══ ISP=({max_i}, {max_j})")
+
+            path_stack = []
+            is_first_segment = (segment_count == 1)
+
+            index, visited_regions = self._dfs_explore(
+                max_i, max_j, visited_regions, path_stack,
+                image_rgb, annotation, index, prev_recv_side=-1,
+                is_segment_start=(not is_first_segment)
+            )
+
+            while True:
+                fork_i, fork_j, unexplored, index = self._backtrack(
+                    path_stack, visited_regions, image_rgb, annotation, index
+                )
+
+                if fork_i is None:
+                    break
+
+                index, visited_regions = self._dfs_explore(
+                    fork_i, fork_j, visited_regions, path_stack,
+                    image_rgb, annotation, index, prev_recv_side=-1
+                )
+
+            if max_segments is not None and segment_count >= max_segments:
+                print(f"[DFS多段] 达到最大段数{max_segments}")
+                break
+
+            new_i, new_j = self._find_new_isp(visited_regions, t_water)
+            if new_i == -9:
+                print("[DFS多段] 全图覆盖完成")
+                break
+
+            visited_regions[new_i:new_i+self.region_size, new_j:new_j+self.region_size] = 1
+            self.path_coords.append((new_i, new_j))
+            x, y = new_j, new_i
+            w, h = self.region_size, self.region_size
+            cv2.rectangle(self.schematic_img, (x, y), (x+w, y+h), (0, 165, 255), 3)
+            cv2.putText(self.schematic_img, f'S{segment_count+1}', (x + 10, y + 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 165, 255), 2)
+
+            max_i, max_j = new_i, new_j
+
+        self.pre_seg(visited_regions, image_rgb, annotation, index)
+
+    def pre_seg(self, visited_regions, image, annotation, index):
+        num_rows = (self.height - self.region_size) // (self.region_size - self.shift_size) + 1
+        num_cols = (self.width - self.region_size) // (self.region_size - self.shift_size) + 1
+
+        total_regions = num_rows * num_cols
+        pbar = tqdm(total=total_regions, desc='补充扫描', unit='区域')
+
+        for row in range(num_rows):
+            for col in range(num_cols):
+                start_x = col * (self.region_size - self.shift_size)
+                start_y = row * (self.region_size - self.shift_size)
+                if (start_y, start_x) not in self.saved_coords:
+                    image_patch = image[:, start_y:start_y+self.region_size, start_x:start_x+self.region_size]
+                    annotation_patch = annotation[:, start_y:start_y+self.region_size, start_x:start_x+self.region_size]
+                    self.save_patch(image_patch, self.image_dir, index, ftc_side=-1, recv_side=-1)
+                    self.save_patch(annotation_patch, self.annotation_dir, index, ftc_side=-1, recv_side=-1)
+                    self.saved_coords.add((start_y, start_x))
+                    index += 1
+
+                pbar.update(1)
+
+        pbar.close()
+
+    def save_patch(self, patch, path, index, ftc_side=-1, recv_side=-1):
+        filename = self.image_name + "/" + self.image_name + f"_{index}" + f"_{ftc_side}_{recv_side}.png"
+        save_path = os.path.join(path, filename)
+        # 规范化路径，确保使用正确的分隔符
+        save_path = os.path.normpath(save_path)
+
+        if path == self.image_dir:
+            self.image_list = dict(filename=filename)
+            self.image_list['annotation'] = dict(seg_map=filename)
+            self.image_info_list.append(self.image_list)
+        if os.path.exists(save_path):
+            return
+
+        patch = patch.transpose(1, 2, 0)
+        patch = patch[:, :, ::-1].copy()
+        # 确保数据类型为uint8
+        if patch.dtype != np.uint8:
+            if patch.max() <= 1.0:
+                patch = (patch * 255).astype(np.uint8)
+            else:
+                patch = patch.astype(np.uint8)
+
+        if not os.path.exists(os.path.dirname(save_path)):
+            os.makedirs(os.path.dirname(save_path))
+        cv2.imwrite(save_path, patch)
+
+    def main(self, method='multi_segment', max_segments=2, alpha=0):
+        """
+        DFS-SGSW 主入口
+
+        参数：
+            method (str): 'single_segment' 或 'multi_segment'
+            max_segments (int or None): 最大段数
+            alpha (float): T_water系数
+        """
+        if method == 'single_segment':
+            self.dfs_single_segment()
+        elif method == 'multi_segment':
+            self.dfs_multi_segment(max_segments=max_segments, alpha=alpha)
+        else:
+            raise ValueError(f"未知方法: {method}")
+
+        os.makedirs(self.schematic_dir, exist_ok=True)
+        existing_files = [f for f in os.listdir(self.schematic_dir)
+                         if f.startswith(f"{self.image_name}_dfs_schematic_")]
+        schematic_num = len(existing_files) + 1
+        schematic_path = os.path.join(self.schematic_dir,
+                                     f"{self.image_name}_dfs_schematic_{schematic_num}.png")
+        print(f"[DFS] 路径保存: {schematic_path}")
+        cv2.imwrite(schematic_path, self.schematic_img)
+        print(f"[DFS] 示意图已保存: {schematic_path}")
+
+        return self.image_info_list
